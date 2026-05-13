@@ -1,0 +1,47 @@
+{
+  "Selfoss": {
+    "lat": 63.9335,
+    "lon": -20.9971,
+    "kind": "bær"
+  },
+  "Eyrarbakki": {
+    "lat": 63.8635,
+    "lon": -21.1492,
+    "kind": "sjávarþorp"
+  },
+  "Stokkseyri": {
+    "lat": 63.837,
+    "lon": -21.0608,
+    "kind": "sjávarþorp"
+  },
+  "Hveragerði": {
+    "lat": 64.0005,
+    "lon": -21.186,
+    "kind": "bær"
+  },
+  "Þorlákshöfn": {
+    "lat": 63.8559,
+    "lon": -21.3834,
+    "kind": "höfn"
+  },
+  "Hellisheiði": {
+    "lat": 64.0359,
+    "lon": -21.3797,
+    "kind": "fjallvegur"
+  },
+  "Hella": {
+    "lat": 63.835,
+    "lon": -20.4,
+    "kind": "bær"
+  },
+  "Vík í Mýrdal": {
+    "lat": 63.4186,
+    "lon": -19.006,
+    "kind": "bær"
+  },
+  "Reykjavík": {
+    "lat": 64.1466,
+    "lon": -21.9426,
+    "kind": "samanburður"
+  }
+}

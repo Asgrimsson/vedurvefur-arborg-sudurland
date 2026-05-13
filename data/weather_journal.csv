@@ -1,0 +1,2 @@
+﻿id,timestamp,student_group,class_group,place,measured_temp,forecast_temp,temp_diff,forecast_wind_ms,wind_words,clouds,precipitation,feeling,tomorrow_prediction,note
+20260513141247665016,2026-05-13 14:12:47,Óskráð,Óskráður hópur,Selfoss,10.0,10.0,0.0,4.1,Logn,Heiðskírt,Engin,Mjög kalt,,
