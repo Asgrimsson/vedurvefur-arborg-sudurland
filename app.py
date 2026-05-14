@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from pathlib import Path
@@ -13,7 +13,7 @@ from pathlib import Path
 load_dotenv()
 
 APP_TITLE = "Veðurvefur Árborgar og Suðurlands"
-APP_VERSION = "2.0"
+APP_VERSION = "2.4"
 TZ = ZoneInfo("Atlantic/Reykjavik")
 
 PLACES = {
@@ -200,21 +200,54 @@ def clothing_tip(temp, wind, rain):
         tips.append("forðast opin svæði í miklum vindi")
     return ", ".join(tips)
 
-def pick_best_windows(hourly, limit=3):
-    if hourly.empty:
+def _friendly_time_label(ts):
+    """Skilar læsilegum tíma fyrir skóladag, t.d. 'Í dag 10:00' eða 'Á morgun 09:00'."""
+    try:
+        now_date = pd.Timestamp.now().date()
+        d = pd.to_datetime(ts).date()
+        hhmm = pd.to_datetime(ts).strftime("%H:%M")
+        if d == now_date:
+            return f"Í dag {hhmm}"
+        if d == (now_date + timedelta(days=1)):
+            return f"Á morgun {hhmm}"
+        return pd.to_datetime(ts).strftime("%d.%m. %H:%M")
+    except Exception:
+        return str(ts)
+
+def pick_best_windows(hourly, limit=3, school_hours=True):
+    if hourly.empty or "time" not in hourly.columns:
         return pd.DataFrame()
+
+    # Fyrir skólanotkun viljum við ekki velja miðnætti sem "besta tíma".
+    # Þess vegna eru bestu gluggar miðaðir við skólatíma 08:00-16:59.
+    df = hourly.head(48).copy()
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"])
+    if school_hours:
+        school_df = df[(df["time"].dt.hour >= 8) & (df["time"].dt.hour <= 16)].copy()
+        if not school_df.empty:
+            df = school_df
+
     rows = []
-    for _, r in hourly.head(24).iterrows():
+    for _, r in df.iterrows():
         score, reasons = school_weather_score(r.get("temp"), r.get("wind"), r.get("rain"), r.get("main"))
         rows.append({
-            "Tími": r["time"].strftime("%H:%M"),
+            "Tími": _friendly_time_label(r["time"]),
             "Mat": score,
             "Hiti": round(r.get("temp", 0), 1),
             "Vindur": round(r.get("wind", 0), 1),
             "Úrkoma": round(r.get("rain", 0), 1),
             "Ábending": ", ".join(reasons),
+            "_time": r["time"],
         })
-    return pd.DataFrame(rows).sort_values(["Mat", "Tími"], ascending=[False, True]).head(limit)
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows).sort_values(["Mat", "_time"], ascending=[False, True])
+    # Forðumst tvítekna tímaglugga sem geta komið úr fallback-gögnum eða næstu dögum.
+    out = out.drop_duplicates(subset=["Tími"]).head(limit)
+    return out.drop(columns=["_time"], errors="ignore")
 
 def travel_score(rows):
     score = 100
@@ -661,6 +694,22 @@ def render_header():
         .traffic-light {font-size:.88rem; padding:.45rem .62rem;}
     }
 
+
+    .place-grid-card {
+        border: 1px solid rgba(148,163,184,.22);
+        border-radius: 22px;
+        padding: 18px;
+        background: linear-gradient(180deg, rgba(255,255,255,.96) 0%, rgba(248,250,252,.96) 100%);
+        box-shadow: 0 10px 28px rgba(15,23,42,.08);
+        min-height: 142px;
+        transition: transform .16s ease, box-shadow .16s ease;
+    }
+    .place-grid-card:hover {transform: translateY(-2px); box-shadow: 0 16px 36px rgba(15,23,42,.12);}
+    .place-title {font-size:1.15rem; font-weight:900; color:#0f172a; margin-bottom:.2rem;}
+    .place-kind {font-size:.88rem; color:#475569; margin-bottom:.45rem;}
+    .place-meta {font-size:.82rem; color:#64748b; line-height:1.35;}
+    .place-active {border: 2px solid #0284c7; background: linear-gradient(180deg, #eff6ff 0%, #ecfeff 100%);}
+    @media (max-width: 900px) {.place-grid-card {min-height:auto; padding:14px; border-radius:18px;}}
     </style>
     """, unsafe_allow_html=True)
 
@@ -756,6 +805,83 @@ def render_current(place, current, source):
               <div class="small-muted">{helptext}</div>
             </div>
             """, unsafe_allow_html=True)
+
+
+def _place_tile_emoji(kind):
+    kind = (kind or "").lower()
+    if "fjall" in kind:
+        return "🏔️"
+    if "höfn" in kind or "ferja" in kind:
+        return "⛴️"
+    if "ey" in kind:
+        return "🏝️"
+    if "þjóðgar" in kind:
+        return "🌿"
+    if "skóla" in kind:
+        return "🏫"
+    if "sjávar" in kind:
+        return "🌊"
+    if "sveit" in kind:
+        return "🌾"
+    if "samanbur" in kind:
+        return "🏙️"
+    return "📍"
+
+
+def _distance_from_selfoss(place):
+    if place == "Selfoss" or place not in PLACES:
+        return 0
+    a = PLACES["Selfoss"]
+    b = PLACES[place]
+    return haversine_km(a["lat"], a["lon"], b["lat"], b["lon"])
+
+
+def render_place_tiles(selected_place):
+    st.markdown("### 🧭 Staðaflísar Suðurlands")
+    st.caption("Smelltu á flís til að færa yfirlitið strax yfir á þann stað. Þetta virkar líka vel á síma og iPad.")
+
+    search = st.text_input("Leita í stöðum", placeholder="t.d. Selfoss, Hella, Vík, Hellisheiði...", key="place_tile_search")
+    kind_filter = st.selectbox(
+        "Sía eftir tegund",
+        ["Allir"] + sorted({v.get("kind", "staður") for v in PLACES.values()}),
+        key="place_tile_kind_filter",
+    )
+
+    places = []
+    for name, info in PLACES.items():
+        if search and search.lower() not in name.lower() and search.lower() not in info.get("kind", "").lower():
+            continue
+        if kind_filter != "Allir" and info.get("kind") != kind_filter:
+            continue
+        places.append((name, info, _distance_from_selfoss(name)))
+
+    places.sort(key=lambda item: item[2])
+    if not places:
+        st.info("Enginn staður fannst með þessari leit/síu.")
+        return
+
+    cols_per_row = 4
+    for i in range(0, len(places), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for col, (name, info, dist) in zip(cols, places[i:i+cols_per_row]):
+            active = name == selected_place
+            card_class = "place-grid-card place-active" if active else "place-grid-card"
+            emoji = _place_tile_emoji(info.get("kind"))
+            with col:
+                st.markdown(f"""
+                <div class="{card_class}">
+                  <div class="place-title">{emoji} {name}</div>
+                  <div class="place-kind">{info.get('kind', 'staður')}</div>
+                  <div class="place-meta">Loftlína frá Selfossi: <b>{dist:.0f} km</b><br>Hnit: {info.get('lat'):.3f}, {info.get('lon'):.3f}</div>
+                </div>
+                """, unsafe_allow_html=True)
+                label = "Opnað" if active else "Opna yfirlit"
+                if st.button(label, key=f"tile_open_{name}", use_container_width=True, disabled=active):
+                    st.session_state["selected_place"] = name
+                    st.rerun()
+
+    st.markdown("#### 💡 Kennsluhugmynd með flísunum")
+    st.info("Láttu nemendur velja þrjá staði á Suðurlandi, bera saman veður, loftlínu frá Selfossi, vind og úrkomu. Síðan rökstyðja þau hvar væri best að fara í útikennslu eða vettvangsferð í dag.")
 
 def render_forecast(hourly, daily):
     st.subheader("📈 Spá fram í tímann")
@@ -1123,8 +1249,12 @@ def evaluate_school_decisions(current, hourly):
         max_wind = float(next_24["wind"].max()) if "wind" in next_24 else wind
         max_rain = float(next_24["rain"].max()) if "rain" in next_24 else rain
         min_temp = float(next_24["temp"].min()) if "temp" in next_24 else (temp or 0)
-        best = next_24.sort_values(["score", "time"], ascending=[False, True]).head(3)
-        best_times = " · ".join(best["time"].dt.strftime("%H:%M").tolist())
+        # Veljum aðeins raunhæfa skólatíma, ekki miðnætti.
+        school_best = next_24[(next_24["time"].dt.hour >= 8) & (next_24["time"].dt.hour <= 16)].copy()
+        if school_best.empty:
+            school_best = next_24.copy()
+        best = school_best.sort_values(["score", "time"], ascending=[False, True]).head(3)
+        best_times = " · ".join([_friendly_time_label(t) for t in best["time"].tolist()])
 
     # Sérhæfð ákvörðunarkort
     frimin_score = max(0, min(100, now_score + (5 if rain < .5 else -10)))
@@ -2526,6 +2656,31 @@ def build_teacher_assignment(place, current, hourly, grade_band, subject, durati
             "Ræðið hvernig hlýnandi loftslag getur haft áhrif á jökla, ár og náttúru á Suðurlandi.",
             "Búið til þrjár spurningar sem þið mynduð vilja rannsaka nánar."
         ],
+        "Umferð og veður": [
+            "Opnið flipann Umferðarteljarar og finnið tvo teljara á Suðurlandi.",
+            "Berið saman veður dagsins og umferðarmagn. Hvaða veðurþættir gætu haft áhrif á ferðalög?",
+            "Skrifið stutta niðurstöðu: Hvenær gæti umferð verið meiri eða minni og af hverju?"
+        ],
+        "Öryggismat ferða": [
+            "Veljið ferðaleið og skoðið Öryggismæli ferða.",
+            "Skráið þrjá áhættuþætti: vind, úrkomu, vegalengd, fjallveg, ferju eða umferð.",
+            "Gefið ferðinni grænt, gult eða rautt mat og rökstyðjið ákvörðunina."
+        ],
+        "Vegalengdir": [
+            "Veljið tvo staði í Vegalengdir og skráið vegalengd, loftlínu og áætlaðan aksturstíma.",
+            "Reiknið hvað vegalengdin er mörgum kílómetrum lengri en loftlínan.",
+            "Útskýrið af hverju vegir liggja ekki alltaf beina leið milli staða."
+        ],
+        "Veðurtákn og orðaforði": [
+            "Opnið Veðurtákn og veljið fimm tákn sem passa við veður dagsins eða spána.",
+            "Skrifið eina útskýringu á hverju tákni með eigin orðum.",
+            "Búið til smá veðurorðabók með að minnsta kosti tíu hugtökum."
+        ],
+        "Veðurdagbók": [
+            "Skráið eigin veðurathugun í Veðurdagbók.",
+            "Berið saman ykkar mælingu við spána á vefnum og reiknið muninn.",
+            "Skrifið ígrundun: Hvað var auðvelt að mæla og hvað var erfiðast?"
+        ],
         "Blanda af öllu": [
             "Skráið hiti, vind, úrkomu og skýjahulu fyrir valinn stað.",
             "Berið saman tvo staði á Suðurlandi og finnið mikilvægasta muninn.",
@@ -2538,6 +2693,7 @@ def build_teacher_assignment(place, current, hourly, grade_band, subject, durati
         "Stærðfræði": "Nemendur vinna með tölur úr raunveruleikanum: hitamun, vegalengd, tíma, meðaltöl og samanburð.",
         "Íslenska": "Nemendur þjálfa lýsandi mál, rökstuðning, orðaforða og stutta kynningu eða fréttatexta.",
         "Landafræði": "Nemendur tengja staði, leiðir, kortalæsi, landslag og veðurfar á Suðurlandi.",
+        "Lífsleikni": "Nemendur þjálfa ákvarðanatöku, samvinnu, öryggishugsun og rökstuðning út frá raunverulegum aðstæðum.",
         "Upplýsinga- og tæknimennt": "Nemendur lesa gögn af vef, nota kort, bera saman heimildir og setja niðurstöður fram stafrænt.",
         "Samþætt verkefni": "Nemendur tengja saman veðurfræði, kortalæsi, stærðfræði, íslensku og stafræna framsetningu.",
     }
@@ -2617,12 +2773,12 @@ def render_teacher_admin(place, current, hourly, selected_route):
     c1, c2, c3 = st.columns(3)
     with c1:
         grade_band = st.selectbox("Bekkur / aldursstig", ["1.–2. bekkur", "3.–4. bekkur", "5.–6. bekkur", "7.–8. bekkur", "9.–10. bekkur"], index=2)
-        subject = st.selectbox("Námsgrein", ["Náttúrufræði", "Stærðfræði", "Íslenska", "Landafræði", "Upplýsinga- og tæknimennt", "Samþætt verkefni"])
+        subject = st.selectbox("Námsgrein", ["Náttúrufræði", "Stærðfræði", "Íslenska", "Landafræði", "Lífsleikni", "Upplýsinga- og tæknimennt", "Samþætt verkefni"])
     with c2:
         duration = st.selectbox("Lengd", ["10 mínútur", "20 mínútur", "40 mínútur", "80 mínútur"], index=1)
         lesson_type = st.selectbox("Kennsluform", ["Einstaklingsverkefni", "Paravinna", "Hópavinna", "Útikennsla", "Stöðvavinna", "Kynningarverkefni"], index=2)
     with c3:
-        focus = st.selectbox("Áhersla", ["Blanda af öllu", "Hiti", "Vindur", "Úrkoma", "Kort og leiðir", "Veðurfrétt", "Loftslag og jöklar"])
+        focus = st.selectbox("Áhersla", ["Blanda af öllu", "Hiti", "Vindur", "Úrkoma", "Kort og leiðir", "Vegalengdir", "Umferð og veður", "Öryggismat ferða", "Veðurtákn og orðaforði", "Veðurdagbók", "Veðurfrétt", "Loftslag og jöklar"])
         difficulty = st.selectbox("Erfiðleikastig", ["Einfalt", "Miðlungs", "Krefjandi"], index=1)
 
     assignment = build_teacher_assignment(place, current, hourly, grade_band, subject, duration, lesson_type, focus, difficulty)
@@ -2670,6 +2826,12 @@ def render_teacher_admin(place, current, hourly, selected_route):
         ("🎙️ Veðurfrétt", "Búið til 30 sekúndna veðurfrétt með tölum, veðurtákni og ráðleggingu."),
         ("📊 Gögn", "Setjið hiti, vind og úrkomu í töflu og skrifið þrjár niðurstöður úr gögnunum."),
         ("🧊 Loftslag", "Útskýrið muninn á veðri dagsins og loftslagi. Tengið við jökla eða ár á Íslandi."),
+        ("🚗 Umferð", "Skoðið umferðarteljara og finnið hvar umferðin er mest. Ræðið hvaða áhrif veður gæti haft."),
+        ("🛡️ Öryggismat", "Veljið ferðaleið og gefið henni grænt, gult eða rautt mat með rökstuðningi."),
+        ("📘 Veðurdagbók", "Skráið mælingu, berið saman við spá og skrifið eina niðurstöðu úr athuguninni."),
+        ("🌦️ Veðurtákn", "Veljið fimm veðurtákn, útskýrið þau og tengið við veðrið í dag."),
+        ("📏 Vegalengdir", "Reiknið mun á loftlínu og vegalengd og útskýrið af hverju munurinn verður til."),
+        ("🧑‍🤝‍🧑 Hópahlutverk", "Skiptið hlutverkum: gagnasafnari, kortasérfræðingur, reiknimeistari, fréttamaður og ritari."),
     ]
     cols = st.columns(3)
     for i, (title, desc) in enumerate(banks):
@@ -2680,6 +2842,125 @@ def render_teacher_admin(place, current, hourly, selected_route):
               <div class="small-muted">{desc}</div>
             </div>
             """, unsafe_allow_html=True)
+
+    st.markdown("### 🧩 Tilbúnir kennslupakkar")
+    st.caption("Veldu pakka og fáðu skýra kennsluáætlun sem hægt er að afrita beint í Classroom, Mentor eða prenta.")
+    package = st.selectbox(
+        "Veldu kennslupakka",
+        [
+            "20 mín — Veðurhraðferð",
+            "40 mín — Veður + stærðfræði",
+            "40 mín — Veðurfréttastofa",
+            "60 mín — Öryggismat skólaferðar",
+            "80 mín — Suðurlandsrannsókn",
+            "Vikupakki — Veðurdagbók og spár"
+        ]
+    )
+
+    package_texts = {
+        "20 mín — Veðurhraðferð": f"""KENNSLUPAKKI: Veðurhraðferð
+Tími: 20 mínútur
+Staður: {place}
+
+Markmið:
+- Nemendur lesa helstu veðurtölur dagsins.
+- Nemendur rökstyðja hvort hentar að fara út.
+
+Framkvæmd:
+1. Kennari sýnir Yfirlit fyrir {place}.
+2. Nemendur skrá hiti, vind, úrkomu og skýjahulu.
+3. Nemendur velja eitt veðurtákn og útskýra það.
+4. Parið svarar: Er gott útiveður? Af hverju?
+
+Skil:
+3 setningar eða stutt munnleg niðurstaða.
+""",
+        "40 mín — Veður + stærðfræði": f"""KENNSLUPAKKI: Veður + stærðfræði
+Tími: 40 mínútur
+
+Markmið:
+- Reikna mun á hitastigi, vindhraða, vegalengd og loftlínu.
+- Setja tölur úr raunheimi í töflu.
+
+Framkvæmd:
+1. Veljið tvo til fjóra staði á Suðurlandi.
+2. Skráið hitastig, vind og skýjahulu.
+3. Reiknið muninn á hæstu og lægstu tölu.
+4. Opnið Vegalengdir og berið saman vegalengd og loftlínu.
+5. Skrifið þrjár stærðfræðilegar niðurstöður.
+
+Aukaverkefni:
+Gerið súlurit eða línurit í Google Sheets.
+""",
+        "40 mín — Veðurfréttastofa": f"""KENNSLUPAKKI: Veðurfréttastofa
+Tími: 40 mínútur
+
+Hlutverk:
+- Veðurfræðingur: finnur tölur dagsins.
+- Kortasérfræðingur: skoðar Kortamiðstöð.
+- Ráðgjafi: gefur klæðnaðarráð.
+- Fréttamaður: skrifar og flytur frétt.
+
+Verkefni:
+Búið til 45–60 sekúndna veðurfrétt fyrir Suðurland. Notið að minnsta kosti fimm veðurorð og rökstyðjið hvort dagurinn henti fyrir útikennslu.
+""",
+        "60 mín — Öryggismat skólaferðar": f"""KENNSLUPAKKI: Öryggismat skólaferðar
+Tími: 60 mínútur
+Leið: {selected_route}
+
+Markmið:
+- Nemendur nota veður, umferð og vegalengd til að taka upplýsta ákvörðun.
+
+Framkvæmd:
+1. Opnið Öryggismæli ferða og veljið leið.
+2. Skráið vegalengd, aksturstíma, vind, úrkomu og helstu áhættuþætti.
+3. Skoðið Umferðarteljara og Kortamiðstöð.
+4. Gefið ferðinni grænt, gult eða rautt mat.
+5. Skrifið skilaboð til foreldra með klæðnaðarráðum og ferðamati.
+""",
+        "80 mín — Suðurlandsrannsókn": f"""KENNSLUPAKKI: Suðurlandsrannsókn
+Tími: 80 mínútur
+
+Rannsóknarspurning:
+Hvar á Suðurlandi er best að vera úti í dag — og af hverju?
+
+Framkvæmd:
+1. Hópar velja 3–4 staði.
+2. Safna gögnum: hiti, vindur, úrkoma, skýjahula, vegalengd og umferð.
+3. Setja gögn í töflu.
+4. Velja besta staðinn fyrir útikennslu eða stutta ferð.
+5. Kynna niðurstöður með korti, tölum og rökstuðningi.
+""",
+        "Vikupakki — Veðurdagbók og spár": f"""KENNSLUPAKKI: Veðurdagbók og spár
+Tími: 5–10 mínútur á dag í eina viku
+
+Daglega:
+1. Skráið veðurathugun í Veðurdagbók.
+2. Spáið fyrir morgundeginum: hiti, vindur, úrkoma og ský.
+3. Daginn eftir: berið spána saman við raunveður.
+
+Í lok vikunnar:
+- Finnið meðalhita.
+- Finnið vindasamasta daginn.
+- Veljið nákvæmustu spána.
+- Skrifið 5 setninga samantekt: Hvað lærðum við um veður?
+"""
+    }
+
+    selected_package_text = package_texts[package]
+    st.text_area("Afritanlegur kennslupakki", selected_package_text, height=360)
+    st.download_button("⬇️ Sækja kennslupakka sem .txt", selected_package_text.encode("utf-8"), file_name=f"kennslupakki_{datetime.now(TZ).strftime('%Y%m%d')}.txt", mime="text/plain", use_container_width=True)
+
+    st.markdown("### 🖨️ Útprentanleg verkefnaspjöld")
+    cards = [
+        f"1. Skráðu veðrið í {place}: hiti, vindur, úrkoma og skýjahula.",
+        "2. Veldu tvo staði og reiknaðu hitamuninn.",
+        "3. Opnaðu Vegalengdir og finndu mun á vegalengd og loftlínu.",
+        "4. Skoðaðu Umferðarteljara. Hvar er mest umferð og hvað gæti skýrt það?",
+        "5. Gefðu ferð grænt/gult/rautt öryggismat og rökstuddu.",
+        "6. Búðu til stutta veðurfrétt með að minnsta kosti 5 veðurorðum."
+    ]
+    st.text_area("Prentvæn verkefnaspjöld — klipptu út eða settu í Classroom", "\n\n".join(cards), height=260)
 
     with st.expander("📌 Kennararáð fyrir notkun"):
         st.markdown(f"""
@@ -2692,15 +2973,723 @@ def render_teacher_admin(place, current, hourly, selected_route):
         """)
 
 
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_traffic_counters():
+    """Sækir umferðarteljara Vegagerðarinnar sem GeoJSON.
+
+    Þjónustan getur skilað dálkum með mismunandi nöfnum eftir uppfærslum, þannig að
+    úrvinnslan er viljandi sveigjanleg: hún finnur heiti, auðkenni, hnit og talnadálka
+    án þess að treysta á eitt fast dálkanafn.
+    """
+    url = "https://gagnaveita.vegagerdin.is/geoserver/gis/ows"
+    params = {
+        "service": "WFS",
+        "version": "1.0.0",
+        "request": "GetFeature",
+        "typeName": "gis:umferdvika_2021_1",
+        "srsName": "EPSG:4326",
+        "outputFormat": "application/json",
+    }
+    r = requests.get(url, params=params, timeout=25)
+    r.raise_for_status()
+    data = r.json()
+    rows = []
+
+    def first_lon_lat(coords):
+        if not coords:
+            return None, None
+        if isinstance(coords, (list, tuple)) and len(coords) >= 2 and all(isinstance(x, (int, float)) for x in coords[:2]):
+            return float(coords[0]), float(coords[1])
+        if isinstance(coords, (list, tuple)):
+            for item in coords:
+                lon, lat = first_lon_lat(item)
+                if lon is not None and lat is not None:
+                    return lon, lat
+        return None, None
+
+    for feature in data.get("features", []):
+        props = feature.get("properties", {}) or {}
+        geom = feature.get("geometry") or {}
+        lon, lat = first_lon_lat(geom.get("coordinates"))
+        row = dict(props)
+        row["lon"] = lon
+        row["lat"] = lat
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    # Finna möguleg heiti og auðkenni.
+    upper = {c.upper(): c for c in df.columns}
+    name_col = upper.get("NAFN") or upper.get("HEITI") or upper.get("NAME")
+    id_col = upper.get("IDSTOD") or upper.get("ID") or upper.get("OBJECTID")
+    if name_col and name_col != "nafn":
+        df["nafn"] = df[name_col].astype(str)
+    elif "nafn" not in df.columns:
+        df["nafn"] = "Ónefndur teljari"
+    if id_col and id_col != "idstod":
+        df["idstod"] = df[id_col].astype(str)
+    elif "idstod" not in df.columns:
+        df["idstod"] = df.index.astype(str)
+
+    # Reyna að breyta líklegum talnadálkum í tölur án þess að valda FutureWarning.
+    for col in df.columns:
+        if col not in ["nafn", "idstod"]:
+            converted = pd.to_numeric(df[col], errors="coerce")
+            # Ef dálkurinn inniheldur einhver talnagildi notum við tölvuútgáfuna, annars höldum við textanum.
+            if converted.notna().any():
+                df[col] = converted
+    return df
+
+
+def south_iceland_traffic(df):
+    """Gróft Suðurlandsfilter út frá WGS84 hnitum."""
+    if df.empty or "lat" not in df.columns or "lon" not in df.columns:
+        return df
+    # Selfoss, Suðurlandsvegur, Þorlákshöfn, Hella, Hvolsvöllur, Vík og nágrenni.
+    mask = (
+        df["lat"].between(63.25, 64.45, inclusive="both")
+        & df["lon"].between(-22.5, -18.0, inclusive="both")
+    )
+    south = df.loc[mask].copy()
+    return south if not south.empty else df.copy()
+
+
+def render_traffic_counters():
+    st.markdown("## 🚗 Umferðarteljarar Vegagerðarinnar")
+    st.caption("Nemendur geta skoðað hvernig umferð dreifist um Suðurland, borið saman staði og tengt gögnin við veður, vegalengdir og ferðaveður.")
+
+    with st.expander("ℹ️ Hvað eru þessi gögn?", expanded=False):
+        st.markdown("""
+        Vegagerðin rekur umferðarteljara víða um land. Þjónustan `gis:umferdvika_2021_1`
+        skilar staðsetningu teljara og talningum, meðal annars fjölda ökutækja síðustu 15 mínútur,
+        frá miðnætti og fyrir síðustu daga þegar gögn eru tiltæk.
+
+        Vefurinn sækir gögnin sem **GeoJSON** með `outputFormat=application/json` og `srsName=EPSG:4326`,
+        svo hægt sé að birta þau á korti í vefnum.
+        """)
+
+    try:
+        df_all = load_traffic_counters()
+    except Exception as e:
+        st.error("Náði ekki að sækja umferðarteljara frá Vegagerðinni.")
+        with st.expander("Sjá tæknivillu"):
+            st.code(str(e))
+        st.link_button("Opna hráa WFS þjónustu", "https://gagnaveita.vegagerdin.is/geoserver/gis/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=gis:umferdvika_2021_1")
+        return
+
+    if df_all.empty:
+        st.warning("Engin gögn bárust frá þjónustunni að þessu sinni.")
+        return
+
+    df_south = south_iceland_traffic(df_all)
+    numeric_cols = []
+    for col in df_south.columns:
+        if col not in ["lat", "lon"] and pd.api.types.is_numeric_dtype(df_south[col]):
+            numeric_cols.append(col)
+
+    # Velja sjálfgefið talnagildi sem lítur út eins og umferð/talning.
+    preferred = None
+    for key in ["MIDN", "MIDNAETTI", "SOLAR", "DAG", "UMFERD", "FJOLDI", "15"]:
+        for col in numeric_cols:
+            if key in col.upper():
+                preferred = col
+                break
+        if preferred:
+            break
+    metric = st.selectbox("Veldu talnadálk til að lita kortið", numeric_cols, index=(numeric_cols.index(preferred) if preferred in numeric_cols else 0)) if numeric_cols else None
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Teljarar á landinu", len(df_all))
+    with col2:
+        st.metric("Teljarar í Suðurlandsglugga", len(df_south))
+    with col3:
+        if metric:
+            st.metric(f"Samtals / meðaltal: {metric}", f"{df_south[metric].sum(skipna=True):,.0f}".replace(",", "."))
+        else:
+            st.metric("Talnadálkar", "finnast ekki")
+
+    search = st.text_input("Leita að teljara eða stað", placeholder="t.d. Selfoss, Hella, Vík, Hellisheiði...")
+    view = df_south.copy()
+    if search:
+        view = view[view["nafn"].str.contains(search, case=False, na=False)]
+
+    st.markdown("### 🗺️ Kort yfir umferðarteljara")
+    if {"lat", "lon"}.issubset(view.columns) and not view.empty:
+        map_df = view.dropna(subset=["lat", "lon"]).copy()
+        hover_cols = [c for c in ["nafn", "idstod", metric] if c and c in map_df.columns]
+
+        # Plotly má ekki fá NaN eða neikvæð gildi í `size`.
+        # Sumir teljarar í WFS-gögnunum skila auðum gildum í völdum talnadálki,
+        # þannig að við búum til hreinan kortadálk sem virkar alltaf.
+        size_col = None
+        color_col = None
+        if metric and metric in map_df.columns:
+            safe_metric = pd.to_numeric(map_df[metric], errors="coerce")
+            color_col = "_kort_gildi"
+            size_col = "_kort_staerd"
+            map_df[color_col] = safe_metric
+            # Stærðin þarf að vera jákvæð tala. Litun má samt sýna NaN sem tómt.
+            positive = safe_metric.fillna(0).clip(lower=0)
+            if positive.max() > 0:
+                map_df[size_col] = positive
+            else:
+                size_col = None
+
+        fig = px.scatter_mapbox(
+            map_df,
+            lat="lat",
+            lon="lon",
+            color=color_col,
+            size=size_col,
+            hover_name="nafn" if "nafn" in map_df.columns else None,
+            hover_data=hover_cols,
+            zoom=6.2,
+            height=560,
+            mapbox_style="open-street-map",
+        )
+        fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Engin kortahniti fundust fyrir valið úrtak.")
+
+    st.markdown("### 📊 Samanburður teljara")
+    if metric and metric in view.columns:
+        top = view[["nafn", "idstod", metric]].dropna().sort_values(metric, ascending=False).head(15)
+        if not top.empty:
+            fig_bar = px.bar(top.sort_values(metric), x=metric, y="nafn", orientation="h", title=f"Mestu gildi í Suðurlandsúrtaki: {metric}")
+            fig_bar.update_layout(height=520, margin={"r":20,"t":55,"l":20,"b":20})
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+    show_cols = [c for c in ["nafn", "idstod", "lat", "lon", metric] if c and c in view.columns]
+    extra_cols = [c for c in numeric_cols if c not in show_cols][:8]
+    st.dataframe(view[show_cols + extra_cols].head(200), use_container_width=True, hide_index=True)
+
+    st.markdown("### 🧑‍🏫 Kennsluhugmyndir")
+    st.markdown("""
+    - **Stærðfræði:** Finnið þrjá umferðarmestu teljarana og reiknið muninn á þeim.
+    - **Landafræði:** Af hverju er meiri umferð á sumum leiðum en öðrum?
+    - **Veður og samfélag:** Berið saman umferð og veður. Heldur fólk sig meira heima þegar veður er slæmt?
+    - **Ferðaskipulag:** Veljið leið á Suðurlandi og rökstyðjið hvar væri best að setja nýjan teljara.
+    - **Gagnalæsi:** Hvað þarf að passa þegar gögn eru sjálfvirk og geta verið gömul, ófullkomin eða tímabundið óaðgengileg?
+    """)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.link_button("Opna WFS þjónustu Vegagerðarinnar", "https://gagnaveita.vegagerdin.is/geoserver/gis/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=gis:umferdvika_2021_1")
+    with col_b:
+        st.link_button("Opna Gagnaveitu Vegagerðarinnar", "https://gagnaveita.vegagerdin.is/")
+
+
+def get_numeric_traffic_columns(df):
+    """Finnur talnadálka í umferðargögnum á öruggan hátt."""
+    if df is None or df.empty:
+        return []
+    skip = {"lat", "lon"}
+    cols = []
+    for col in df.columns:
+        if col in skip:
+            continue
+        if pd.api.types.is_numeric_dtype(df[col]):
+            cols.append(col)
+    return cols
+
+
+def choose_default_traffic_metric(numeric_cols):
+    """Velur líklegasta umferðardálkinn sjálfkrafa."""
+    for key in ["MIDN", "MIDNAETTI", "SÓLAR", "SOLAR", "DAG", "UMFERD", "UMF", "FJOLDI", "15"]:
+        for col in numeric_cols:
+            if key in col.upper():
+                return col
+    return numeric_cols[0] if numeric_cols else None
+
+
+def traffic_level_label(value):
+    if value is None or pd.isna(value):
+        return "óþekkt", "⚪", "Engin eða ófullkomin talnagögn bárust frá teljara."
+    try:
+        value = float(value)
+    except Exception:
+        return "óþekkt", "⚪", "Ekki tókst að lesa talnagildi."
+    if value >= 2500:
+        return "mikil umferð", "🔴", "Mikil umferð miðað við kennslumatið — gott að ræða álag, öryggi og tíma dags."
+    if value >= 900:
+        return "nokkur umferð", "🟡", "Nokkur umferð — hentar vel til samanburðar milli staða."
+    return "lítil umferð", "🟢", "Lítil umferð — skoðið hvort staðsetning, tími eða veður geti skýrt það."
+
+
+def nearest_traffic_counters(df, lat, lon, n=8):
+    if df is None or df.empty or "lat" not in df.columns or "lon" not in df.columns:
+        return pd.DataFrame()
+    out = df.dropna(subset=["lat", "lon"]).copy()
+    if out.empty:
+        return out
+    out["fjarlægð_km"] = out.apply(lambda r: haversine_km(lat, lon, r["lat"], r["lon"]), axis=1)
+    return out.sort_values("fjarlægð_km").head(n)
+
+
+def route_weather_rows(route_points, api_key):
+    rows = []
+    for rp in route_points:
+        if rp not in PLACES:
+            continue
+        try:
+            data = load_weather(rp)
+            current = data[0]
+            if current:
+                rows.append({
+                    "staður": rp,
+                    "hiti": current.get("temp"),
+                    "vindur": current.get("wind"),
+                    "úrkoma": current.get("rain", 0),
+                    "ský": current.get("clouds"),
+                    "veður": current.get("desc", ""),
+                })
+        except Exception:
+            rows.append({"staður": rp, "hiti": None, "vindur": None, "úrkoma": None, "ský": None, "veður": "gögn vantar"})
+    return pd.DataFrame(rows)
+
+
+def render_weather_traffic_comparison(place, current, hourly, selected_route):
+    st.markdown("## 🌦️🚗 Veður + umferð samanburður")
+    st.caption("Hér skoða nemendur hvort umferð og veður geti tengst saman: vindur, úrkoma, hitastig, ferðaleiðir og umferðarteljarar á Suðurlandi.")
+
+    st.markdown("""
+    <div class="feature-card">
+      <h3>Rannsóknarspurning dagsins</h3>
+      <p>Hefur veður áhrif á það hvernig fólk ferðast? Skoðum núverandi veður og nálæga umferðarteljara og búum til tilgátu.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    api_key = get_api_key()
+    try:
+        df_all = load_traffic_counters()
+        df_south = south_iceland_traffic(df_all)
+    except Exception as e:
+        st.error("Náði ekki að sækja umferðargögn frá Vegagerðinni.")
+        with st.expander("Sjá tæknivillu"):
+            st.code(str(e))
+        return
+
+    if df_south.empty:
+        st.warning("Engin umferðargögn fundust fyrir Suðurlandsglugga.")
+        return
+
+    numeric_cols = get_numeric_traffic_columns(df_south)
+    default_metric = choose_default_traffic_metric(numeric_cols)
+    metric = st.selectbox(
+        "Veldu umferðartölu til samanburðar",
+        numeric_cols,
+        index=(numeric_cols.index(default_metric) if default_metric in numeric_cols else 0),
+        key="weather_traffic_metric"
+    ) if numeric_cols else None
+
+    analysis_mode = st.radio(
+        "Hvað viltu bera saman?",
+        ["Nálægir teljarar við valinn stað", "Ferðaleiðin í hliðarvalmynd", "Topp 10 umferð á Suðurlandi"],
+        horizontal=True,
+        key="weather_traffic_mode"
+    )
+
+    place_info = PLACES.get(place, PLACES["Selfoss"])
+    weather_score, weather_reasons = school_weather_score(
+        current.get("temp") if current else None,
+        current.get("wind") if current else None,
+        current.get("rain") if current else 0,
+        current.get("main") if current else None,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Staður", place)
+    c2.metric("Veðurmat", f"{weather_score}%", score_label(weather_score))
+    c3.metric("Vindur", f"{current.get('wind', 0):.1f} m/s" if current else "—")
+    c4.metric("Úrkoma", f"{current.get('rain', 0):.1f} mm" if current else "—")
+
+    if analysis_mode == "Nálægir teljarar við valinn stað":
+        view = nearest_traffic_counters(df_south, place_info["lat"], place_info["lon"], n=12)
+        title = f"Næstu umferðarteljarar við {place}"
+    elif analysis_mode == "Ferðaleiðin í hliðarvalmynd":
+        route_points = ROUTES.get(selected_route, [])
+        frames = []
+        for rp in route_points:
+            info = PLACES.get(rp)
+            if info:
+                near = nearest_traffic_counters(df_south, info["lat"], info["lon"], n=4)
+                if not near.empty:
+                    near = near.copy()
+                    near["leiðarpunktur"] = rp
+                    frames.append(near)
+        view = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["idstod"], keep="first") if frames else pd.DataFrame()
+        title = f"Teljarar nálægt ferðaleið: {selected_route}"
+    else:
+        view = df_south.copy()
+        if metric and metric in view.columns:
+            view["_metric_clean"] = pd.to_numeric(view[metric], errors="coerce")
+            view = view.sort_values("_metric_clean", ascending=False).head(10)
+        title = "Umferðarmestu teljarar í Suðurlandsglugga"
+
+    st.markdown(f"### {title}")
+    if view.empty:
+        st.info("Engir teljarar fundust fyrir valið úrtak.")
+        return
+
+    if metric and metric in view.columns:
+        clean_metric = pd.to_numeric(view[metric], errors="coerce")
+        total = clean_metric.sum(skipna=True)
+        avg = clean_metric.mean(skipna=True)
+        top_val = clean_metric.max(skipna=True)
+        label, emoji, level_text = traffic_level_label(avg)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Samtals í úrtaki", f"{total:,.0f}".replace(",", "."))
+        m2.metric("Meðaltal á teljara", f"{avg:,.0f}".replace(",", "."))
+        m3.metric("Umferðarmat", f"{emoji} {label}")
+        st.info(level_text)
+    else:
+        clean_metric = None
+        st.info("Enginn talnadálkur fannst til samanburðar.")
+
+    map_df = view.dropna(subset=["lat", "lon"]).copy()
+    if not map_df.empty:
+        color_col = None
+        size_col = None
+        if metric and metric in map_df.columns:
+            vals = pd.to_numeric(map_df[metric], errors="coerce")
+            map_df["_umferd_litur"] = vals
+            positive = vals.fillna(0).clip(lower=0)
+            if positive.max() > 0:
+                map_df["_umferd_staerd"] = positive
+                size_col = "_umferd_staerd"
+            color_col = "_umferd_litur"
+        hover_cols = [c for c in ["nafn", "idstod", metric, "fjarlægð_km", "leiðarpunktur"] if c and c in map_df.columns]
+        fig = px.scatter_mapbox(
+            map_df,
+            lat="lat",
+            lon="lon",
+            color=color_col,
+            size=size_col,
+            hover_name="nafn" if "nafn" in map_df.columns else None,
+            hover_data=hover_cols,
+            zoom=6.4,
+            height=520,
+            mapbox_style="open-street-map",
+        )
+        fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
+        st.plotly_chart(fig, use_container_width=True)
+
+    if metric and metric in view.columns:
+        bar_df = view.copy()
+        bar_df["_metric_clean"] = pd.to_numeric(bar_df[metric], errors="coerce")
+        bar_df = bar_df.dropna(subset=["_metric_clean"]).sort_values("_metric_clean", ascending=False).head(12)
+        if not bar_df.empty:
+            fig_bar = px.bar(
+                bar_df.sort_values("_metric_clean"),
+                x="_metric_clean",
+                y="nafn",
+                orientation="h",
+                title=f"Samanburður á umferðargildi: {metric}",
+            )
+            fig_bar.update_layout(height=470, margin={"r":20,"t":55,"l":20,"b":20}, xaxis_title=metric, yaxis_title="Teljari")
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+    st.markdown("### 🧠 Sjálfvirk túlkun fyrir nemendur")
+    temp = current.get("temp") if current else None
+    wind = current.get("wind") if current else None
+    rain = current.get("rain") if current else 0
+    weather_words = []
+    if rain and rain >= 1:
+        weather_words.append("úrkoma gæti haft áhrif á akstur og útiveru")
+    if wind and wind >= 10:
+        weather_words.append("vindur er orðinn það mikill að hann skiptir máli fyrir ferðalög")
+    if temp is not None and temp <= 0:
+        weather_words.append("frost getur aukið líkur á hálku")
+    if not weather_words:
+        weather_words.append("veðrið virðist ekki setja miklar skorður á ferðalög samkvæmt einföldu mati")
+
+    st.markdown(f"""
+    - **Veðurstaða:** {', '.join(weather_reasons)}.
+    - **Hugsanleg áhrif:** {', '.join(weather_words)}.
+    - **Tilgáta:** Ef veður versnar, gæti umferð minnkað á sumum leiðum eða færst til á tíma dags. Þetta þarf að sannreyna með fleiri mælingum.
+    - **Varúð:** Ein mæling sýnir ekki orsök. Til að finna samband þarf að skoða marga daga og bera saman við veður á sama tíma.
+    """)
+
+    with st.expander("🧑‍🏫 Verkefni: Veður og umferð", expanded=True):
+        assignment = f"""Verkefni: Veður + umferð á Suðurlandi
+
+1. Veldu stað eða ferðaleið í Veðurvefnum.
+2. Skráðu veðrið: hiti, vindur, úrkoma og skýjahula.
+3. Skoðaðu umferðarteljara nálægt staðnum eða leiðinni.
+4. Finndu hæsta og lægsta umferðargildið í úrtakinu.
+5. Settu fram tilgátu: Hefur veðrið áhrif á umferðina? Af hverju / af hverju ekki?
+6. Skrifaðu 5–7 línur þar sem þú notar bæði tölur og orð.
+
+Valinn staður: {place}
+Valin leið: {selected_route}
+Veðurmat: {weather_score}% ({', '.join(weather_reasons)})
+Umferðardálkur: {metric or 'engin talnagögn'}
+"""
+        st.text_area("Afritanlegt verkefni", assignment, height=260)
+        st.download_button("⬇️ Sækja verkefni sem TXT", assignment, file_name="vedur_umferd_verkefni.txt", mime="text/plain")
+
+    if analysis_mode == "Ferðaleiðin í hliðarvalmynd":
+        st.markdown("### 🌦️ Veður á leiðarpunktum")
+        route_points = ROUTES.get(selected_route, [])
+        weather_df = route_weather_rows(route_points, api_key)
+        if not weather_df.empty:
+            st.dataframe(weather_df, use_container_width=True, hide_index=True)
+
+    show_cols = [c for c in ["nafn", "idstod", "lat", "lon", "fjarlægð_km", "leiðarpunktur", metric] if c and c in view.columns]
+    st.markdown("### 🔎 Gögnin sem eru notuð")
+    st.dataframe(view[show_cols].head(100), use_container_width=True, hide_index=True)
+
+    st.markdown("### 💡 Snilldarhugmyndir fyrir næstu útgáfu")
+    st.markdown("""
+    - **Tímaraðir:** safna veðri og umferð daglega í CSV/Google Sheets og skoða þróun yfir vikur.
+    - **Spálíkan nemenda:** nemendur reyna að spá hvort umferð verði meiri eða minni á morgun út frá veðurspá.
+    - **Öryggismælir ferða:** sameina vind, úrkomu, vegalengd og umferð í eitt ferðamat.
+    - **Kortaleikur:** hver finnur leiðina þar sem veður er best en umferð minnst?
+    - **Samfélagsrýni:** ræða hvernig veður, skólar, vinna, frídagar og ferðamennska hafa áhrif á umferð.
+    """)
+
+
+
+def _risk_label(score):
+    if score >= 72:
+        return "Rautt", "🔴", "Há áhætta / bíða eða endurmeta", "Mælt er með að skoða Veðurstofu, Umferðina og Vegagerð áður en farið er. Fyrir skólaferð væri skynsamlegt að ræða við stjórnendur."
+    if score >= 42:
+        return "Gult", "🟡", "Varúð / undirbúa vel", "Ferðin getur gengið, en gott er að hafa varaáætlun, fylgjast með breytingum og senda skýr skilaboð um klæðnað."
+    return "Grænt", "🟢", "Gott ferðaveður miðað við kennslumat", "Engin stór veðurmerki sjást í þessu einfalda mati, en alltaf þarf að skoða opinberar upplýsingar áður en lagt er af stað."
+
+
+def _safe_float(value, default=0.0):
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _score_weather_point(row):
+    temp = _safe_float(row.get("hiti"), 0)
+    wind = _safe_float(row.get("vindur"), 0)
+    rain = _safe_float(row.get("úrkoma"), 0)
+    clouds = _safe_float(row.get("ský"), 0)
+    score = 0
+    reasons = []
+    if wind >= 18:
+        score += 35; reasons.append(f"mjög hvasst við {row.get('staður', 'leiðarpunkt')} ({wind:.1f} m/s)")
+    elif wind >= 12:
+        score += 24; reasons.append(f"nokkuð hvasst við {row.get('staður', 'leiðarpunkt')} ({wind:.1f} m/s)")
+    elif wind >= 8:
+        score += 10; reasons.append(f"vindur getur haft áhrif við {row.get('staður', 'leiðarpunkt')} ({wind:.1f} m/s)")
+    if rain >= 5:
+        score += 22; reasons.append(f"talsverð úrkoma við {row.get('staður', 'leiðarpunkt')} ({rain:.1f} mm)")
+    elif rain >= 1:
+        score += 10; reasons.append(f"einhver úrkoma við {row.get('staður', 'leiðarpunkt')} ({rain:.1f} mm)")
+    if temp <= -3:
+        score += 22; reasons.append(f"frost við {row.get('staður', 'leiðarpunkt')} ({temp:.1f}°C)")
+    elif temp <= 1:
+        score += 10; reasons.append(f"kalt nálægt frostmarki við {row.get('staður', 'leiðarpunkt')} ({temp:.1f}°C)")
+    if clouds >= 95:
+        score += 4
+    return score, reasons
+
+
+def render_travel_safety_meter(place, current, hourly, selected_route):
+    st.markdown("## 🛡️ Öryggismælir ferða")
+    st.caption("Kennslumælir sem sameinar veður, vegalengd, leiðarpunkta og umferðargögn. Þetta er ekki opinbert öryggismat heldur hjálpartæki fyrir nemendur og kennara til að ræða ferðaskipulag.")
+
+    route_names = list(ROUTES.keys())
+    default_index = route_names.index(selected_route) if selected_route in route_names else 0
+    route = st.selectbox("Veldu ferðaleið til að meta", route_names, index=default_index, key="safety_route")
+    route_points = ROUTES.get(route, [])
+    start = route_points[0] if route_points else place
+    end = route_points[-1] if route_points else place
+
+    distance, path = shortest_route(start, end) if start in ROAD_PLACES and end in ROAD_PLACES else (None, [])
+    route_distance_score = 0
+    distance_reason = None
+    if distance is not None:
+        if distance >= 120:
+            route_distance_score = 18; distance_reason = f"löng leið ({distance:.0f} km)"
+        elif distance >= 70:
+            route_distance_score = 10; distance_reason = f"miðlungs löng leið ({distance:.0f} km)"
+        else:
+            route_distance_score = 4; distance_reason = f"stutt/miðlungs leið ({distance:.0f} km)"
+
+    weather_df = route_weather_rows(route_points, get_api_key())
+    weather_score = 0
+    weather_reasons = []
+    if not weather_df.empty:
+        for _, row in weather_df.iterrows():
+            sc, reasons = _score_weather_point(row)
+            weather_score = max(weather_score, sc)
+            weather_reasons.extend(reasons)
+    else:
+        # fallback: nota núverandi stað ef leiðarveður fæst ekki
+        temp = _safe_float(current.get("temp") if current else None, 0)
+        wind = _safe_float(current.get("wind") if current else None, 0)
+        rain = _safe_float(current.get("rain") if current else None, 0)
+        fake = {"staður": place, "hiti": temp, "vindur": wind, "úrkoma": rain, "ský": current.get("clouds") if current else 0}
+        weather_score, weather_reasons = _score_weather_point(fake)
+
+    traffic_score = 0
+    traffic_reason = "umferðargögn ekki notuð"
+    traffic_view = pd.DataFrame()
+    metric = None
+    try:
+        df_all = load_traffic_counters()
+        df_south = south_iceland_traffic(df_all)
+        numeric_cols = get_numeric_traffic_columns(df_south)
+        metric = choose_default_traffic_metric(numeric_cols)
+        if metric and route_points:
+            chunks = []
+            for rp in route_points:
+                info = PLACES.get(rp) or ROAD_PLACES.get(rp)
+                if not info:
+                    continue
+                near = nearest_traffic_counters(df_south, info["lat"], info["lon"], n=4)
+                if not near.empty:
+                    near = near.copy()
+                    near["leiðarpunktur"] = rp
+                    chunks.append(near)
+            if chunks:
+                traffic_view = pd.concat(chunks, ignore_index=True).drop_duplicates(subset=["idstod"] if "idstod" in chunks[0].columns else None)
+                vals = pd.to_numeric(traffic_view[metric], errors="coerce").dropna() if metric in traffic_view.columns else pd.Series(dtype=float)
+                if not vals.empty:
+                    high = float(vals.max())
+                    avg = float(vals.mean())
+                    if high >= 2500:
+                        traffic_score = 18; traffic_reason = f"mikil umferð á einhverjum teljara ({high:.0f})"
+                    elif high >= 900:
+                        traffic_score = 10; traffic_reason = f"nokkur umferð á leiðinni (hæsta gildi {high:.0f})"
+                    else:
+                        traffic_score = 4; traffic_reason = f"lítil/meðal umferð í nálægum teljurum (meðaltal {avg:.0f})"
+    except Exception as e:
+        traffic_reason = f"náði ekki að sækja umferðargögn: {e}"
+
+    special_score = 0
+    special_reasons = []
+    if "Hellisheiði" in route_points:
+        special_score += 10
+        special_reasons.append("leiðin fer um Hellisheiði/fjallveg")
+    if "Vestmannaeyjar" in route_points or "Landeyjahöfn" in route_points:
+        special_score += 10
+        special_reasons.append("leiðin tengist ferju/sjóleið")
+    if "Vík í Mýrdal" in route_points or "Skógar" in route_points or "Sólheimajökull" in route_points:
+        special_score += 6
+        special_reasons.append("leiðin nær lengra austur þar sem veður getur breyst hratt")
+
+    total_score = min(100, weather_score + route_distance_score + traffic_score + special_score)
+    color, icon, label, advice = _risk_label(total_score)
+
+    st.markdown(f"""
+    <div class="hero">
+      <div>
+        <div class="small">Öryggismælir ferða · {route}</div>
+        <h1>{icon} {label}</h1>
+        <p>Heildarmat: <b>{total_score:.0f}/100</b> · staða: <b>{color}</b></p>
+      </div>
+      <div style="text-align:right">
+        <div class="big-metric">{total_score:.0f}%</div>
+        <div class="small">varúðarmælir</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Veðuráhætta", f"{weather_score:.0f}/60")
+    c2.metric("Vegalengd", f"{distance:.0f} km" if distance is not None else "—")
+    c3.metric("Umferð", traffic_reason.split("(")[0].strip())
+    c4.metric("Leið", " → ".join(route_points[:2]) + ("..." if len(route_points) > 2 else ""))
+
+    st.info(advice)
+
+    st.markdown("### 🔎 Af hverju er matið svona?")
+    reasons = []
+    if weather_reasons:
+        reasons.extend(weather_reasons[:6])
+    if distance_reason:
+        reasons.append(distance_reason)
+    if traffic_reason:
+        reasons.append(traffic_reason)
+    reasons.extend(special_reasons)
+    if not reasons:
+        reasons = ["Engin sérstök áhættumerki fundust í kennslumatinu."]
+    for r in reasons:
+        st.markdown(f"- {r}")
+
+    st.markdown("### ✅ Gátlisti fyrir kennara")
+    checklist_items = [
+        "Skoða Veðurstofu Íslands áður en lagt er af stað.",
+        "Skoða Umferðina/Vegagerðina, sérstaklega ef farið er um fjallveg.",
+        "Athuga vind og hviður, ekki bara hitastig.",
+        "Meta klæðnað: jakki, regnföt, húfa/vettlingar, góðir skór.",
+        "Hafa varaáætlun ef veður eða færð breytist.",
+        "Senda skýr skilaboð til foreldra/nemenda um klæðnað og tímasetningu.",
+    ]
+    for item in checklist_items:
+        st.checkbox(item, value=False, key="safe_" + item[:18])
+
+    st.markdown("### 🌦️ Veður á leiðarpunktum")
+    if not weather_df.empty:
+        st.dataframe(weather_df, use_container_width=True, hide_index=True)
+    else:
+        st.warning("Náði ekki að sækja leiðarveður að þessu sinni.")
+
+    if path:
+        st.markdown("### 🗺️ Leið og vegalengd")
+        st.write(f"Áætluð leið: **{' → '.join(path)}**")
+        st.write(f"Áætlaður aksturstími: **{estimate_drive_time(distance)}**")
+        render_distance_map(path)
+
+    if not traffic_view.empty and metric:
+        st.markdown("### 🚗 Nálægir umferðarteljarar")
+        cols = [c for c in ["leiðarpunktur", "nafn", "idstod", "fjarlægð_km", metric] if c in traffic_view.columns]
+        st.dataframe(traffic_view[cols].head(30), use_container_width=True, hide_index=True)
+
+    st.markdown("### 🧑‍🏫 Verkefni fyrir nemendur")
+    assignment = f"""Verkefni: Öryggismælir ferða
+
+Leið: {route}
+Mat vefsins: {icon} {label} ({total_score:.0f}/100)
+
+1. Skráðu þrjár tölur úr veðurspánni á leiðinni: hiti, vindur og úrkoma.
+2. Skráðu áætlaða vegalengd og aksturstíma.
+3. Skoðaðu einn umferðarteljara nálægt leiðinni. Hvað segir hann?
+4. Nefndu tvö atriði sem gætu gert ferð öruggari.
+5. Ertu sammála mati vefsins? Rökstuddu svarið með gögnum.
+
+Mundu: Þetta er kennslumat. Fyrir alvöru ferðir þarf að skoða opinberar upplýsingar frá Veðurstofu Íslands, Umferðinni og Vegagerðinni.
+"""
+    st.text_area("Afritanlegt verkefni", assignment, height=260)
+    st.download_button("⬇️ Sækja verkefni sem TXT", assignment, file_name="oryggismaelir_ferda.txt", mime="text/plain")
+
+    st.markdown("### 🔗 Opna opinberar upplýsingar")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.link_button("Veðurstofan", "https://www.vedur.is/")
+    b2.link_button("Umferðin", "https://umferdin.is/")
+    b3.link_button("Vegagerðin", "https://www.vegagerdin.is/")
+    b4.link_button("Map.is", "https://map.is/")
+
+
 def main():
     render_header()
 
     with st.sidebar:
         st.title("🌦️ Veðurvefur")
-        place = st.selectbox("Veldu stað", list(PLACES.keys()), index=0)
+        if "selected_place" not in st.session_state or st.session_state["selected_place"] not in PLACES:
+            st.session_state["selected_place"] = "Selfoss"
+        place_options = list(PLACES.keys())
+        place_index = place_options.index(st.session_state["selected_place"])
+        place = st.selectbox("Veldu stað", place_options, index=place_index)
+        st.session_state["selected_place"] = place
         page = st.radio(
             "Veldu síðu",
-            ["Yfirlit", "Veðurborð skólans", "Kennaraumsjón", "Suðurlandsmælir", "Veðurstjóri skólans", "Veðurstofa bekkjarins", "Veðurleiðangrar", "Veðurdagbók", "Vegalengdir", "Veðurtákn", "Kortamiðstöð", "Spá", "Skólaveður", "Ferðaveður", "Kort", "Fróðleikur", "Gögn og tengingar"],
+            ["Yfirlit", "Veðurborð skólans", "Kennaraumsjón", "Umferðarteljarar", "Veður + umferð", "Öryggismælir ferða", "Suðurlandsmælir", "Veðurstjóri skólans", "Veðurstofa bekkjarins", "Veðurleiðangrar", "Veðurdagbók", "Vegalengdir", "Veðurtákn", "Kortamiðstöð", "Spá", "Skólaveður", "Ferðaveður", "Kort", "Fróðleikur", "Gögn og tengingar"],
         )
         selected_route = st.selectbox("Ferðaleið", list(ROUTES.keys()), index=0)
         st.caption("Ferðaleiðin er notuð í Ferðaveður/Kortamiðstöð. Fyrir frjálst val á tveimur stöðum: opnaðu flipann 📏 Vegalengdir.")
@@ -2723,6 +3712,8 @@ def main():
 
     if page == "Yfirlit":
         render_current(place, current, source)
+        render_place_tiles(place)
+        st.divider()
         render_daily_weather_card(place, current, hourly)
         st.divider()
         render_alerts(alerts)
@@ -2732,6 +3723,12 @@ def main():
         render_school_board(place, current, hourly, selected_route)
     elif page == "Kennaraumsjón":
         render_teacher_admin(place, current, hourly, selected_route)
+    elif page == "Umferðarteljarar":
+        render_traffic_counters()
+    elif page == "Veður + umferð":
+        render_weather_traffic_comparison(place, current, hourly, selected_route)
+    elif page == "Öryggismælir ferða":
+        render_travel_safety_meter(place, current, hourly, selected_route)
     elif page == "Suðurlandsmælir":
         render_sudurland_meter(place, current, hourly, selected_route)
     elif page == "Veðurstjóri skólans":
