@@ -9,11 +9,12 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 load_dotenv()
 
 APP_TITLE = "Veðurvefur Árborgar og Suðurlands"
-APP_VERSION = "2.4"
+APP_VERSION = "2.6.1"
 TZ = ZoneInfo("Atlantic/Reykjavik")
 
 PLACES = {
@@ -1171,12 +1172,477 @@ def render_map(selected_place):
     st.map(df, latitude="lat", longitude="lon", size=80, zoom=8)
     st.caption(f"Valinn staður: {selected_place}")
 
+
+
+# =========================
+# Veðurstofa Íslands - CAP viðvaranir
+# =========================
+CAP_ACTIVE_DETAILED_URL = "https://api.vedur.is/cap/v1/capbroker/active/detailed/all"
+CAP_ACTIVE_DETAILED_URL_ALT = "https://api.vedur.is/cap/capbroker/active/detailed/all"
+CAP_ACTIVE_FEED_URL = "https://api.vedur.is/cap/v1/capbroker/active/feed/met"
+CAP_ACTIVE_FEED_URL_ALT = "https://api.vedur.is/cap/capbroker/active/feed/met"
+CAP_BASE_URL = "https://api.vedur.is/cap/v1"
+CAP_SOURCE_URLS = [
+    CAP_ACTIVE_DETAILED_URL,
+    CAP_ACTIVE_DETAILED_URL + "/",
+    CAP_ACTIVE_DETAILED_URL_ALT,
+    CAP_ACTIVE_DETAILED_URL_ALT + "/",
+    CAP_ACTIVE_FEED_URL,
+    CAP_ACTIVE_FEED_URL_ALT,
+]
+
+SOUTH_ALERT_TERMS = [
+    "suðurland", "sudurland", "south iceland", "south", "suðausturland", "sudausturland",
+    "miðhálend", "mid highland", "hellisheiði", "hellisheidi", "vestmannaeyjar",
+    "eyjafjall", "mýrdal", "myrdal", "vík", "vik", "selfoss", "árborg", "arborg",
+    "hvolsvöllur", "hvolsvollur", "hella", "landeyjahöfn", "landeyjahofn"
+]
+
+SEVERITY_ORDER = {
+    "Extreme": 4, "Severe": 3, "Moderate": 2, "Minor": 1, "Unknown": 0,
+    "Rauð": 4, "Appelsínugul": 3, "Gul": 2, "Græn": 1,
+}
+
+SEVERITY_ICELANDIC = {
+    "Extreme": "Rauð / mjög alvarleg",
+    "Severe": "Appelsínugul / alvarleg",
+    "Moderate": "Gul / varúð",
+    "Minor": "Minni háttar",
+    "Unknown": "Óþekkt",
+}
+
+
+def _text_contains_south(text):
+    txt = str(text or "").lower()
+    return any(term in txt for term in SOUTH_ALERT_TERMS)
+
+
+def _cap_get(d, *keys, default=""):
+    if not isinstance(d, dict):
+        return default
+    for k in keys:
+        if k in d and d.get(k) not in (None, ""):
+            return d.get(k)
+    return default
+
+
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _find_cap_messages(payload):
+    """Finnur CAP skilaboð í mismunandi JSON-formum án þess að treysta á eitt fast schema."""
+    messages = []
+    def walk(obj):
+        if isinstance(obj, dict):
+            # CAP skilaboð hafa oft identifier/sent/info eða properties.info
+            if ("info" in obj and ("identifier" in obj or "sent" in obj or "msgType" in obj)):
+                messages.append(obj)
+                return
+            if "properties" in obj and isinstance(obj["properties"], dict) and "info" in obj["properties"]:
+                merged = dict(obj["properties"])
+                if "geometry" in obj:
+                    merged["geometry"] = obj.get("geometry")
+                messages.append(merged)
+                return
+            for key in ["features", "messages", "items", "alerts", "data", "results"]:
+                if key in obj:
+                    walk(obj[key])
+            # fallback: leita dýpra en passa að tvítaka ekki of mikið
+            for v in obj.values():
+                if isinstance(v, (list, dict)):
+                    walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+    walk(payload)
+    # Hreinsa tvítekningar eftir identifier + sent
+    unique = []
+    seen = set()
+    for msg in messages:
+        key = (str(_cap_get(msg, "identifier", "id", default="")), str(_cap_get(msg, "sent", default="")))
+        if key not in seen:
+            seen.add(key)
+            unique.append(msg)
+    return unique
+
+
+def _format_cap_time(value):
+    if not value:
+        return "—"
+    txt = str(value)
+    try:
+        # styður bæði Z og ISO offset
+        dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+        return dt.astimezone(TZ).strftime("%d.%m.%Y kl. %H:%M")
+    except Exception:
+        return txt
+
+
+def _normalize_cap_alerts(payload):
+    rows = []
+    for msg in _find_cap_messages(payload):
+        infos = _as_list(msg.get("info"))
+        if not infos:
+            infos = [msg]
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            areas = _as_list(info.get("area"))
+            area_names = []
+            for area in areas:
+                if isinstance(area, dict):
+                    area_names.append(str(_cap_get(area, "areaDesc", "area", "name", default="")))
+                elif area:
+                    area_names.append(str(area))
+            area_text = ", ".join([a for a in area_names if a]) or str(_cap_get(info, "areaDesc", "area", default=""))
+            event = str(_cap_get(info, "event", "headline", default="Veðurviðvörun"))
+            headline = str(_cap_get(info, "headline", "event", default=event))
+            description = str(_cap_get(info, "description", "text", "summary", default=""))
+            instruction = str(_cap_get(info, "instruction", "web", default=""))
+            severity = str(_cap_get(info, "severity", "awareness_level", default="Unknown"))
+            urgency = str(_cap_get(info, "urgency", default=""))
+            certainty = str(_cap_get(info, "certainty", default=""))
+            category = _cap_get(info, "category", default="")
+            if isinstance(category, list):
+                category = ", ".join(map(str, category))
+            combined = " ".join([event, headline, description, instruction, area_text, str(category)])
+            rows.append({
+                "identifier": _cap_get(msg, "identifier", "id", default=""),
+                "sent": _cap_get(msg, "sent", default=""),
+                "sender": _cap_get(msg, "sender", "senderName", default="Veðurstofa Íslands"),
+                "event": event,
+                "headline": headline,
+                "description": description,
+                "instruction": instruction,
+                "severity": severity,
+                "severity_is": SEVERITY_ICELANDIC.get(severity, severity),
+                "severity_score": SEVERITY_ORDER.get(severity, 0),
+                "urgency": urgency,
+                "certainty": certainty,
+                "category": str(category),
+                "area": area_text or "Ótilgreint svæði",
+                "effective": _cap_get(info, "effective", default=""),
+                "onset": _cap_get(info, "onset", default=""),
+                "expires": _cap_get(info, "expires", default=""),
+                "snertir_sudurland": _text_contains_south(combined),
+            })
+    return rows
+
+
+def _xml_text(elem, tag_name):
+    """Sækir texta úr XML án þess að þurfa að þekkja namespace nákvæmlega."""
+    if elem is None:
+        return ""
+    for child in list(elem):
+        if child.tag.split("}")[-1] == tag_name:
+            return (child.text or "").strip()
+    return ""
+
+
+def _xml_children(elem, tag_name):
+    if elem is None:
+        return []
+    return [child for child in list(elem) if child.tag.split("}")[-1] == tag_name]
+
+
+def _normalize_cap_xml(xml_text):
+    """Les CAP XML eða RSS/Atom feed frá Veðurstofu og skilar sömu röðum og JSON-lesarinn."""
+    try:
+        root = ET.fromstring(xml_text.encode("utf-8") if isinstance(xml_text, str) else xml_text)
+    except Exception:
+        return []
+
+    rows = []
+    # 1) Raunveruleg CAP <alert> skilaboð, ef þau eru í XML-inu.
+    alerts = [el for el in root.iter() if el.tag.split("}")[-1] == "alert"]
+    for alert in alerts:
+        msg = {
+            "identifier": _xml_text(alert, "identifier"),
+            "sender": _xml_text(alert, "sender") or "Veðurstofa Íslands",
+            "sent": _xml_text(alert, "sent"),
+            "info": [],
+        }
+        for info in _xml_children(alert, "info"):
+            area_names = []
+            for area in _xml_children(info, "area"):
+                desc = _xml_text(area, "areaDesc")
+                if desc:
+                    area_names.append(desc)
+            msg["info"].append({
+                "event": _xml_text(info, "event") or "Veðurviðvörun",
+                "headline": _xml_text(info, "headline") or _xml_text(info, "event") or "Veðurviðvörun",
+                "description": _xml_text(info, "description"),
+                "instruction": _xml_text(info, "instruction"),
+                "severity": _xml_text(info, "severity") or "Unknown",
+                "urgency": _xml_text(info, "urgency"),
+                "certainty": _xml_text(info, "certainty"),
+                "category": _xml_text(info, "category"),
+                "area": ", ".join(area_names),
+                "effective": _xml_text(info, "effective"),
+                "onset": _xml_text(info, "onset"),
+                "expires": _xml_text(info, "expires"),
+            })
+        rows.extend(_normalize_cap_alerts(msg))
+
+    if rows:
+        return rows
+
+    # 2) Ef þjónustan skilar RSS/Atom yfirliti í stað CAP XML, lesum titla og lýsingar.
+    for item in [el for el in root.iter() if el.tag.split("}")[-1] in ("item", "entry")]:
+        title = _xml_text(item, "title") or "Veðurviðvörun"
+        summary = _xml_text(item, "summary") or _xml_text(item, "description") or ""
+        updated = _xml_text(item, "updated") or _xml_text(item, "pubDate") or _xml_text(item, "published")
+        combined = f"{title} {summary}"
+        sev = "Unknown"
+        low = combined.lower()
+        if any(x in low for x in ["red", "rauð", "raudur"]):
+            sev = "Extreme"
+        elif any(x in low for x in ["orange", "appelsínugul"]):
+            sev = "Severe"
+        elif any(x in low for x in ["yellow", "gul"]):
+            sev = "Moderate"
+        rows.append({
+            "identifier": title,
+            "sent": updated,
+            "sender": "Veðurstofa Íslands",
+            "event": title,
+            "headline": title,
+            "description": summary,
+            "instruction": "Skoðið nánari upplýsingar á vedur.is áður en ákvörðun er tekin.",
+            "severity": sev,
+            "severity_is": SEVERITY_ICELANDIC.get(sev, sev),
+            "severity_score": SEVERITY_ORDER.get(sev, 0),
+            "urgency": "",
+            "certainty": "",
+            "category": "Met",
+            "area": "Sjá nánar á vedur.is",
+            "effective": updated,
+            "onset": updated,
+            "expires": "",
+            "snertir_sudurland": _text_contains_south(combined),
+        })
+    return rows
+
+
+def _load_cap_from_url(url):
+    headers = {
+        "Accept": "application/json, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.5",
+        "User-Agent": "Vallaskoli-Vedurvefur/2.6.1 (+https://streamlit.app)",
+    }
+    r = requests.get(url, timeout=20, headers=headers)
+    status = r.status_code
+    ctype = (r.headers.get("content-type") or "").lower()
+    text = r.text or ""
+    if status in (204, 404) or not text.strip():
+        return {"ok": True, "rows": [], "source": url, "note": f"Tómt svar eða engar virkar viðvaranir. HTTP {status}"}
+    r.raise_for_status()
+
+    # Prófum JSON fyrst þegar það lítur út eins og JSON.
+    stripped = text.lstrip()
+    if "json" in ctype or stripped.startswith(("{", "[")):
+        payload = r.json()
+        return {"ok": True, "rows": _normalize_cap_alerts(payload), "source": url, "note": "JSON"}
+
+    # Annars prófum XML/RSS/Atom.
+    if "xml" in ctype or stripped.startswith("<"):
+        rows = _normalize_cap_xml(text)
+        return {"ok": True, "rows": rows, "source": url, "note": "XML/RSS"}
+
+    raise ValueError(f"Óþekkt svar frá CAP þjónustu. HTTP {status}, content-type={ctype}, byrjun={text[:80]!r}")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_vedur_cap_alerts():
+    """Sækir virkar CAP-viðvaranir frá Veðurstofu Íslands.
+
+    API-ið hefur verið að skila mismunandi formum eftir endpointi og stöðu viðvarana,
+    svo við reynum bæði /cap/v1 og /cap, JSON og RSS/XML áður en við gefumst upp.
+    """
+    errors = []
+    for url in CAP_SOURCE_URLS:
+        try:
+            result = _load_cap_from_url(url)
+            result.setdefault("rows", [])
+            result.setdefault("error", "")
+            result["ok"] = True
+            return result
+        except Exception as e:
+            errors.append(f"{url} -> {type(e).__name__}: {e}")
+    return {"ok": False, "rows": [], "error": "\n".join(errors), "source": ""}
+
+
+def highest_cap_status(rows):
+    if not rows:
+        return "Engar virkar viðvaranir", "good", "✅", 0
+    high = max([int(r.get("severity_score", 0) or 0) for r in rows])
+    if high >= 4:
+        return "Rauð viðvörun / mjög alvarlegt", "danger", "🔴", high
+    if high >= 3:
+        return "Appelsínugul viðvörun / alvarlegt", "danger", "🟠", high
+    if high >= 2:
+        return "Gul viðvörun / varúð", "warn", "🟡", high
+    return "Viðvörun til skoðunar", "warn", "⚠️", high
+
+
+def render_cap_alert_cards(rows, show_empty=True):
+    if not rows:
+        if show_empty:
+            st.success("Engar virkar CAP-viðvaranir fundust í þessum flokki núna.")
+        return
+    for r in sorted(rows, key=lambda x: (x.get("severity_score", 0), str(x.get("onset") or x.get("effective") or "")), reverse=True):
+        label = r.get("severity_is") or r.get("severity") or "Óþekkt"
+        title = r.get("headline") or r.get("event") or "Veðurviðvörun"
+        south = " · Suðurland tengt" if r.get("snertir_sudurland") else ""
+        with st.expander(f"⚠️ {title} — {label}{south}", expanded=bool(r.get("snertir_sudurland"))):
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Alvarleiki", label)
+            c2.metric("Svæði", str(r.get("area") or "—")[:42])
+            c3.metric("Gildir til", _format_cap_time(r.get("expires")))
+            st.write(f"**Atburður:** {r.get('event') or '—'}")
+            st.write(f"**Gildir frá:** {_format_cap_time(r.get('onset') or r.get('effective'))}")
+            if r.get("description"):
+                st.markdown("**Lýsing:**")
+                st.write(r.get("description"))
+            if r.get("instruction"):
+                st.markdown("**Leiðbeiningar:**")
+                st.write(r.get("instruction"))
+            st.caption(f"Auðkenni: {r.get('identifier') or '—'} · Sent: {_format_cap_time(r.get('sent'))}")
+
+
+def render_vedur_alert_summary(place=None, selected_route=None, compact=True):
+    data = load_vedur_cap_alerts()
+    if not data.get("ok"):
+        if not compact:
+            st.warning("Náði ekki að sækja viðvaranir frá Veðurstofu Íslands í augnablikinu.")
+            st.caption(data.get("error", ""))
+        return []
+    rows = data.get("rows", [])
+    south_rows = [r for r in rows if r.get("snertir_sudurland")]
+    target_rows = south_rows or rows
+    status, klass, emoji, _ = highest_cap_status(target_rows)
+    if compact:
+        if south_rows:
+            st.warning(f"{emoji} Virkar viðvaranir sem gætu snert Suðurland: {len(south_rows)} · {status}")
+        elif rows:
+            st.info(f"⚠️ Virkar viðvaranir á landinu: {len(rows)}. Engin greinileg Suðurlandsviðvörun fannst í texta skilaboða.")
+        else:
+            st.success("✅ Engar virkar CAP-viðvaranir frá Veðurstofu Íslands fundust núna.")
+    return rows
+
+
+def render_vedur_alerts_page(place, current, hourly, selected_route):
+    st.markdown("## ⚠️ Viðvaranir Veðurstofu Íslands")
+    st.caption("Sækir virkar CAP-viðvaranir frá Veðurstofu Íslands og tengir þær við skóla-, ferðalaga- og kennslunotkun. Gögnin eru opinber viðvörunarskilaboð, en vefurinn okkar túlkar þau aðeins sem kennslu- og yfirlitstæki.")
+
+    data = load_vedur_cap_alerts()
+    if not data.get("ok"):
+        st.error("Náði ekki að sækja viðvaranir frá Veðurstofu Íslands.")
+        st.code(data.get("error", "Óþekkt villa"))
+        st.link_button("Opna viðvaranir á vedur.is", "https://www.vedur.is/vidvaranir/")
+        return
+
+    rows = data.get("rows", [])
+    south_rows = [r for r in rows if r.get("snertir_sudurland")]
+    status_all, klass_all, emoji_all, high_all = highest_cap_status(rows)
+    status_south, klass_south, emoji_south, high_south = highest_cap_status(south_rows)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Virkar viðvaranir", len(rows))
+    c2.metric("Tengdar Suðurlandi", len(south_rows))
+    c3.metric("Hæsta mat", status_south if south_rows else status_all)
+    c4.metric("Valinn staður", place)
+
+    if south_rows:
+        st.markdown(f"""
+        <div class="weather-hero" style="background:linear-gradient(135deg,#7c2d12,#f97316);">
+          <div style="display:flex;justify-content:space-between;gap:18px;align-items:center;flex-wrap:wrap;">
+            <div>
+              <div style="opacity:.85;font-weight:800;">Viðvaranir · Suðurland</div>
+              <h1 style="margin:.3rem 0;font-size:2.2rem;">{emoji_south} {status_south}</h1>
+              <p style="margin:0;opacity:.9;">Skoðaðu áhrif á útikennslu, frímínútur, umferð og skólaferðir áður en ákvörðun er tekin.</p>
+            </div>
+            <div style="font-size:3rem;font-weight:900;">{len(south_rows)}</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+    elif rows:
+        st.info("Það eru virkar viðvaranir á landinu, en engin fannst sem textinn tengir beint við Suðurland. Skoðaðu samt listann ef ferð er fyrirhuguð út fyrir Suðurland.")
+    else:
+        st.success("Engar virkar CAP-viðvaranir fundust núna.")
+
+    tabs = st.tabs(["🌍 Suðurland", "🇮🇸 Allar viðvaranir", "🛡️ Áhrif á skóla/ferðir", "🧑‍🏫 Kennsluverkefni", "🔗 Gögn"])
+    with tabs[0]:
+        st.markdown("### Viðvaranir sem gætu snert Suðurland")
+        render_cap_alert_cards(south_rows)
+    with tabs[1]:
+        st.markdown("### Allar virkar CAP-viðvaranir")
+        render_cap_alert_cards(rows)
+    with tabs[2]:
+        st.markdown("### Hvernig hefur þetta áhrif á ákvarðanir?")
+        target = south_rows or rows
+        if not target:
+            st.success("Engin virk viðvörun fannst. Venjulegt veðurmat vefsins gildir áfram.")
+        else:
+            _, _, _, high = highest_cap_status(target)
+            if high >= 4:
+                st.error("🔴 **Rauð eða mjög alvarleg viðvörun:** Ekki skipuleggja útikennslu eða skólaferðir nema stjórnendur meti aðstæður sérstaklega og fylgi opinberum leiðbeiningum.")
+            elif high >= 3:
+                st.warning("🟠 **Appelsínugul/alvarleg viðvörun:** Endurmeta skólaferðir, útikennslu og langa útiveru. Skoða þarf Umferðina, Veðurstofu og Vegagerð áður en farið er af stað.")
+            elif high >= 2:
+                st.warning("🟡 **Gul viðvörun:** Góð ástæða til að stytta útiveru, velja skjól, fylgjast með vindi/úrkomu og undirbúa foreldratilkynningu ef farið er í ferð.")
+            else:
+                st.info("⚠️ Viðvörun eða skilaboð eru til skoðunar. Lesið lýsingu og svæði áður en ákvörðun er tekin.")
+
+            msg = f"""Stutt tilkynning:
+Veðurstofa Íslands er með virka viðvörun sem gæti haft áhrif á skólastarf eða ferðir. Við fylgjumst með stöðu mála og metum útiveru/ferðir út frá veðri, færð og opinberum leiðbeiningum.
+
+Valinn staður: {place}
+Ferðaleið: {selected_route}
+Viðvörunarstaða: {highest_cap_status(target)[0]}
+"""
+            st.text_area("Afritanleg tilkynning", msg, height=170)
+            c1, c2, c3 = st.columns(3)
+            c1.link_button("Veðurstofan — viðvaranir", "https://www.vedur.is/vidvaranir/")
+            c2.link_button("Umferðin.is", "https://umferdin.is/")
+            c3.link_button("Vegagerðin", "https://www.vegagerdin.is/")
+    with tabs[3]:
+        assignment = f"""Verkefni: Veðurviðvaranir Veðurstofu Íslands
+
+1. Opnaðu flipann Viðvaranir.
+2. Finndu hvort einhver viðvörun tengist Suðurlandi.
+3. Skráðu: lit/stig viðvörunar, svæði, tíma og helstu hættu.
+4. Útskýrðu með eigin orðum hvað viðvörunin þýðir fyrir:
+   a) frímínútur
+   b) útikennslu
+   c) ferð frá Selfossi til Reykjavíkur eða Víkur
+5. Berðu saman við vind, úrkomu og hitastig í Veðurvefnum.
+6. Skrifaðu 3 ráð til nemenda eða foreldra.
+
+Aukaverkefni: Finndu á korti hvaða svæði viðvörunin nær yfir og útskýrðu af hverju veður getur verið verra á fjallvegum en í byggð.
+"""
+        st.text_area("Afritanlegt verkefni", assignment, height=310)
+        st.download_button("⬇️ Sækja verkefni sem TXT", assignment, file_name="vedurvidvaranir_verkefni.txt", mime="text/plain")
+        st.info("Kennslutenging: náttúrufræði, landafræði, upplýsinga- og miðlalæsi, samfélagsfræði og lífsleikni.")
+    with tabs[4]:
+        st.markdown("### API-tenging")
+        st.code("\n".join(CAP_SOURCE_URLS))
+        st.write("Vefurinn reynir fyrst JSON frá CAP API og fellur svo yfir í XML/RSS ef þjónustan skilar ekki JSON. Þetta kemur í veg fyrir villuna `Expecting value: line 1 column 1` þegar þjónustan skilar tómu eða XML-svari.")
+        st.link_button("Opna CAP API skjöl", "https://api.vedur.is/")
+        st.link_button("Opna viðvaranir á vedur.is", "https://www.vedur.is/vidvaranir/")
+
 def render_alerts(alerts):
     st.subheader("⚠️ Viðvaranir")
+    render_vedur_alert_summary(compact=True)
     if not alerts:
-        st.info("Engar OpenWeather-viðvaranir bárust með þessu kalli. Skoðaðu samt alltaf Veðurstofu Íslands þegar veður er varasamt.")
+        st.caption("OpenWeather skilaði engum sérviðvörunum með þessu kalli. CAP-viðvaranir Veðurstofu Íslands eru birtar hér að ofan og í sér flipanum Viðvaranir.")
         st.link_button("Opna viðvaranir Veðurstofu Íslands", "https://www.vedur.is/vidvaranir/")
         return
+    st.markdown("#### OpenWeather-viðvaranir")
     for a in alerts:
         with st.expander(a.get("event", "Viðvörun"), expanded=True):
             start = fmt_time(a.get("start"))
@@ -1213,6 +1679,8 @@ def render_sources():
     """)
     st.link_button("OpenWeather One Call API", "https://openweathermap.org/api/one-call-3")
     st.link_button("Veðurstofa Íslands API", "https://api.vedur.is/")
+    st.link_button("CAP viðvaranir Veðurstofu", "https://api.vedur.is/")
+    st.link_button("Viðvaranir á vedur.is", "https://www.vedur.is/vidvaranir/")
     st.link_button("Umferðin.is", "https://umferdin.is/")
     st.link_button("Gagnaveita Vegagerðarinnar", "https://gagnaveita.vegagerdin.is/")
     st.link_button("Zoom Earth vindkort Selfoss", "https://zoom.earth/places/iceland/selfoss/#map=wind-speed/model=icon")
@@ -3500,7 +3968,8 @@ def _score_weather_point(row):
 
 def render_travel_safety_meter(place, current, hourly, selected_route):
     st.markdown("## 🛡️ Öryggismælir ferða")
-    st.caption("Kennslumælir sem sameinar veður, vegalengd, leiðarpunkta og umferðargögn. Þetta er ekki opinbert öryggismat heldur hjálpartæki fyrir nemendur og kennara til að ræða ferðaskipulag.")
+    st.caption("Kennslumælir sem sameinar veður, vegalengd, leiðarpunkta, umferðargögn og CAP-viðvaranir Veðurstofu Íslands. Þetta er ekki opinbert öryggismat heldur hjálpartæki fyrir nemendur og kennara til að ræða ferðaskipulag.")
+    render_vedur_alert_summary(place, selected_route, compact=True)
 
     route_names = list(ROUTES.keys())
     default_index = route_names.index(selected_route) if selected_route in route_names else 0
@@ -3689,7 +4158,7 @@ def main():
         st.session_state["selected_place"] = place
         page = st.radio(
             "Veldu síðu",
-            ["Yfirlit", "Veðurborð skólans", "Kennaraumsjón", "Umferðarteljarar", "Veður + umferð", "Öryggismælir ferða", "Suðurlandsmælir", "Veðurstjóri skólans", "Veðurstofa bekkjarins", "Veðurleiðangrar", "Veðurdagbók", "Vegalengdir", "Veðurtákn", "Kortamiðstöð", "Spá", "Skólaveður", "Ferðaveður", "Kort", "Fróðleikur", "Gögn og tengingar"],
+            ["Yfirlit", "Viðvaranir", "Veðurborð skólans", "Kennaraumsjón", "Umferðarteljarar", "Veður + umferð", "Öryggismælir ferða", "Suðurlandsmælir", "Veðurstjóri skólans", "Veðurstofa bekkjarins", "Veðurleiðangrar", "Veðurdagbók", "Vegalengdir", "Veðurtákn", "Kortamiðstöð", "Spá", "Skólaveður", "Ferðaveður", "Kort", "Fróðleikur", "Gögn og tengingar"],
         )
         selected_route = st.selectbox("Ferðaleið", list(ROUTES.keys()), index=0)
         st.caption("Ferðaleiðin er notuð í Ferðaveður/Kortamiðstöð. Fyrir frjálst val á tveimur stöðum: opnaðu flipann 📏 Vegalengdir.")
@@ -3719,6 +4188,8 @@ def main():
         render_alerts(alerts)
         st.divider()
         render_forecast(hourly, daily)
+    elif page == "Viðvaranir":
+        render_vedur_alerts_page(place, current, hourly, selected_route)
     elif page == "Veðurborð skólans":
         render_school_board(place, current, hourly, selected_route)
     elif page == "Kennaraumsjón":
