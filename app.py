@@ -3525,18 +3525,105 @@ def south_iceland_traffic(df):
     return south if not south.empty else df.copy()
 
 
+
+def traffic_friendly_label(col):
+    """Birtir mannvæn heiti á algengum dálkum úr umferðargögnum Vegagerðarinnar."""
+    if not col:
+        return "Óþekkt gildi"
+    u = str(col).upper()
+    if "UMF" in u and "DAG" in u:
+        return "Umferð í dag"
+    if "UMF" in u and ("15" in u or "MIN" in u):
+        return "Umferð síðustu 15 mín."
+    if "MID" in u or "MIÐ" in u:
+        return "Umferð frá miðnætti"
+    if "SOLAR" in u or "SÓLAR" in u or "DAG" in u:
+        return "Sólarhringsumferð"
+    if "MEDAL" in u or "MEÐAL" in u:
+        return "Meðalumferð"
+    if "HRA" in u or "SPEED" in u:
+        return "Hraði / mæligildi"
+    if "HLUTF" in u or "PRC" in u or "%" in u:
+        return "Hlutfall"
+    return str(col).replace("_", " ").title()
+
+
+def choose_traffic_metric_for_overview(numeric_cols):
+    """Velur það gildi sem hentar best í yfirlitskortið."""
+    if not numeric_cols:
+        return None
+    priority = [
+        "UMF_I_DAG", "UMF_DAG", "UMFERD_DAG", "MIDN", "MIÐN", "MIDNAETTI",
+        "UMF_15", "15", "UMFERD", "FJOLDI", "FJÖLDI", "DAG", "SOLAR"
+    ]
+    for key in priority:
+        for col in numeric_cols:
+            if key in str(col).upper():
+                return col
+    return numeric_cols[0]
+
+
+def classify_traffic_values(df, metric):
+    """Býr til litaflokka fyrir kortið út frá dreifingu gildanna."""
+    out = df.copy()
+    if not metric or metric not in out.columns or out.empty:
+        out["umferdarstig"] = "Óþekkt"
+        out["kort_staerd"] = 12
+        out["kort_gildi"] = 0
+        return out
+    values = pd.to_numeric(out[metric], errors="coerce").fillna(0).clip(lower=0)
+    out["kort_gildi"] = values
+    positive = values[values > 0]
+    if positive.empty:
+        out["umferdarstig"] = "Engin mæling / 0"
+        out["kort_staerd"] = 12
+        return out
+    q50 = positive.quantile(0.50)
+    q80 = positive.quantile(0.80)
+    q95 = positive.quantile(0.95)
+
+    def label(v):
+        if v <= 0:
+            return "Engin mæling / 0"
+        if v >= q95:
+            return "Mjög mikil umferð"
+        if v >= q80:
+            return "Mikil umferð"
+        if v >= q50:
+            return "Meðalumferð"
+        return "Lítil umferð"
+
+    out["umferdarstig"] = values.apply(label)
+    vmax = max(float(values.max()), 1.0)
+    out["kort_staerd"] = 9 + (values / vmax * 25)
+    out["kort_staerd"] = out["kort_staerd"].fillna(9).clip(lower=8, upper=34)
+    return out
+
+
+def traffic_summary_text(df, metric):
+    if df is None or df.empty or not metric or metric not in df.columns:
+        return "Engin talnagögn fundust til að túlka."
+    values = pd.to_numeric(df[metric], errors="coerce").fillna(0).clip(lower=0)
+    active = int((values > 0).sum())
+    if active == 0:
+        return "Teljarar fundust, en valið mæligildi sýnir engar virkar talningar núna. Prófaðu annan dálk."
+    top_row = df.loc[values.idxmax()]
+    top_name = top_row.get("nafn", "ónefndur teljari")
+    total = values.sum()
+    return f"Í Suðurlandsglugganum eru {active} teljarar með gildi yfir 0. Hæsta gildið er hjá **{top_name}** og samanlagt valið mæligildi er **{total:,.0f}**.".replace(",", ".")
+
 def render_traffic_counters():
     st.markdown("## 🚗 Umferðarteljarar Vegagerðarinnar")
-    st.caption("Nemendur geta skoðað hvernig umferð dreifist um Suðurland, borið saman staði og tengt gögnin við veður, vegalengdir og ferðaveður.")
+    st.caption("Raunverulegt umferðaryfirlit úr Gagnaveitu Vegagerðarinnar. Kortið sýnir teljara, umferðarmagn og hvar umferðin er mest á Suðurlandi.")
 
-    with st.expander("ℹ️ Hvað eru þessi gögn?", expanded=False):
+    with st.expander("ℹ️ Hvað er nýtt hér?", expanded=False):
         st.markdown("""
-        Vegagerðin rekur umferðarteljara víða um land. Þjónustan `gis:umferdvika_2021_1`
-        skilar staðsetningu teljara og talningum, meðal annars fjölda ökutækja síðustu 15 mínútur,
-        frá miðnætti og fyrir síðustu daga þegar gögn eru tiltæk.
+        Þessi síða sækir WFS-gögn frá Vegagerðinni og býr til **alvöru kortayfirlit** yfir umferðarteljara.
 
-        Vefurinn sækir gögnin sem **GeoJSON** með `outputFormat=application/json` og `srsName=EPSG:4326`,
-        svo hægt sé að birta þau á korti í vefnum.
+        - Punktarnir eru raunverulegir teljarar úr gagnaveitu Vegagerðarinnar.
+        - Stærð punkta fylgir völdu umferðargildi.
+        - Litur sýnir hvort umferð er lítil, meðal, mikil eða mjög mikil miðað við aðra teljara í úrtakinu.
+        - Gögnin geta verið ófullkomin eða tímabundið tóm, svo þetta er frábært kennsluverkefni í gagnalæsi.
         """)
 
     try:
@@ -3553,104 +3640,127 @@ def render_traffic_counters():
         return
 
     df_south = south_iceland_traffic(df_all)
-    numeric_cols = []
-    for col in df_south.columns:
-        if col not in ["lat", "lon"] and pd.api.types.is_numeric_dtype(df_south[col]):
-            numeric_cols.append(col)
+    numeric_cols = get_numeric_traffic_columns(df_south)
+    default_metric = choose_traffic_metric_for_overview(numeric_cols)
 
-    # Velja sjálfgefið talnagildi sem lítur út eins og umferð/talning.
-    preferred = None
-    for key in ["MIDN", "MIDNAETTI", "SOLAR", "DAG", "UMFERD", "FJOLDI", "15"]:
-        for col in numeric_cols:
-            if key in col.upper():
-                preferred = col
-                break
-        if preferred:
-            break
-    metric = st.selectbox("Veldu talnadálk til að lita kortið", numeric_cols, index=(numeric_cols.index(preferred) if preferred in numeric_cols else 0)) if numeric_cols else None
+    metric_labels = {c: f"{traffic_friendly_label(c)}  ({c})" for c in numeric_cols}
+    metric = None
+    if numeric_cols:
+        metric = st.selectbox(
+            "Veldu umferðargildi á kortið",
+            numeric_cols,
+            index=numeric_cols.index(default_metric) if default_metric in numeric_cols else 0,
+            format_func=lambda c: metric_labels.get(c, c),
+            help="Prófaðu mismunandi dálka. Sumir sýna umferð í dag, aðrir síðustu 15 mínútur eða önnur mæligildi eftir því hvað þjónustan skilar."
+        )
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Teljarar á landinu", len(df_all))
-    with col2:
-        st.metric("Teljarar í Suðurlandsglugga", len(df_south))
-    with col3:
-        if metric:
-            st.metric(f"Samtals / meðaltal: {metric}", f"{df_south[metric].sum(skipna=True):,.0f}".replace(",", "."))
-        else:
-            st.metric("Talnadálkar", "finnast ekki")
-
-    search = st.text_input("Leita að teljara eða stað", placeholder="t.d. Selfoss, Hella, Vík, Hellisheiði...")
+    search = st.text_input("Leita að teljara eða stað", placeholder="t.d. Selfoss, Hella, Vík, Hellisheiði, Landeyjahöfn...")
     view = df_south.copy()
     if search:
         view = view[view["nafn"].str.contains(search, case=False, na=False)]
 
-    st.markdown("### 🗺️ Kort yfir umferðarteljara")
-    if {"lat", "lon"}.issubset(view.columns) and not view.empty:
-        map_df = view.dropna(subset=["lat", "lon"]).copy()
-        hover_cols = [c for c in ["nafn", "idstod", metric] if c and c in map_df.columns]
+    map_df = view.dropna(subset=["lat", "lon"]).copy() if {"lat", "lon"}.issubset(view.columns) else pd.DataFrame()
+    map_df = classify_traffic_values(map_df, metric)
 
-        # Plotly má ekki fá NaN eða neikvæð gildi í `size`.
-        # Sumir teljarar í WFS-gögnunum skila auðum gildum í völdum talnadálki,
-        # þannig að við búum til hreinan kortadálk sem virkar alltaf.
-        size_col = None
-        color_col = None
-        if metric and metric in map_df.columns:
-            safe_metric = pd.to_numeric(map_df[metric], errors="coerce")
-            color_col = "_kort_gildi"
-            size_col = "_kort_staerd"
-            map_df[color_col] = safe_metric
-            # Stærðin þarf að vera jákvæð tala. Litun má samt sýna NaN sem tómt.
-            positive = safe_metric.fillna(0).clip(lower=0)
-            if positive.max() > 0:
-                map_df[size_col] = positive
-            else:
-                size_col = None
-
-        fig = px.scatter_mapbox(
-            map_df,
-            lat="lat",
-            lon="lon",
-            color=color_col,
-            size=size_col,
-            hover_name="nafn" if "nafn" in map_df.columns else None,
-            hover_data=hover_cols,
-            zoom=6.2,
-            height=560,
-            mapbox_style="open-street-map",
-        )
-        fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
-        st.plotly_chart(fig, use_container_width=True)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Teljarar á landinu", len(df_all))
+    m2.metric("Teljarar í Suðurlandsglugga", len(df_south))
+    m3.metric("Teljarar á korti", len(map_df))
+    if metric and metric in df_south.columns:
+        vals = pd.to_numeric(df_south[metric], errors="coerce").fillna(0).clip(lower=0)
+        m4.metric(traffic_friendly_label(metric), f"{vals.sum():,.0f}".replace(",", "."))
     else:
-        st.info("Engin kortahniti fundust fyrir valið úrtak.")
+        m4.metric("Talnagildi", "vantar")
 
-    st.markdown("### 📊 Samanburður teljara")
-    if metric and metric in view.columns:
-        top = view[["nafn", "idstod", metric]].dropna().sort_values(metric, ascending=False).head(15)
-        if not top.empty:
-            fig_bar = px.bar(top.sort_values(metric), x=metric, y="nafn", orientation="h", title=f"Mestu gildi í Suðurlandsúrtaki: {metric}")
-            fig_bar.update_layout(height=520, margin={"r":20,"t":55,"l":20,"b":20})
-            st.plotly_chart(fig_bar, use_container_width=True)
+    st.info(traffic_summary_text(df_south, metric))
 
-    show_cols = [c for c in ["nafn", "idstod", "lat", "lon", metric] if c and c in view.columns]
-    extra_cols = [c for c in numeric_cols if c not in show_cols][:8]
-    st.dataframe(view[show_cols + extra_cols].head(200), use_container_width=True, hide_index=True)
+    tab_map, tab_top, tab_data, tab_tasks = st.tabs(["🗺️ Lifandi kort", "📊 Umferðarmest", "🔎 Gögn", "🧑‍🏫 Kennsla"])
 
-    st.markdown("### 🧑‍🏫 Kennsluhugmyndir")
-    st.markdown("""
-    - **Stærðfræði:** Finnið þrjá umferðarmestu teljarana og reiknið muninn á þeim.
-    - **Landafræði:** Af hverju er meiri umferð á sumum leiðum en öðrum?
-    - **Veður og samfélag:** Berið saman umferð og veður. Heldur fólk sig meira heima þegar veður er slæmt?
-    - **Ferðaskipulag:** Veljið leið á Suðurlandi og rökstyðjið hvar væri best að setja nýjan teljara.
-    - **Gagnalæsi:** Hvað þarf að passa þegar gögn eru sjálfvirk og geta verið gömul, ófullkomin eða tímabundið óaðgengileg?
-    """)
+    with tab_map:
+        st.markdown("### 🗺️ Umferðaryfirlit á korti")
+        if not map_df.empty:
+            hover_cols = [c for c in ["nafn", "idstod", "umferdarstig", "kort_gildi", metric] if c and c in map_df.columns]
+            fig = px.scatter_mapbox(
+                map_df,
+                lat="lat",
+                lon="lon",
+                color="umferdarstig",
+                size="kort_staerd",
+                hover_name="nafn" if "nafn" in map_df.columns else None,
+                hover_data=hover_cols,
+                category_orders={"umferdarstig": ["Mjög mikil umferð", "Mikil umferð", "Meðalumferð", "Lítil umferð", "Engin mæling / 0", "Óþekkt"]},
+                zoom=6.25,
+                center={"lat": 63.93, "lon": -20.35},
+                height=620,
+                mapbox_style="open-street-map",
+            )
+            fig.update_layout(
+                margin={"r":0,"t":0,"l":0,"b":0},
+                legend_title_text="Umferðarstig",
+            )
+            st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
+            st.caption("💡 Þú getur nú zoomað inn og út með músarhjólinu/trackpad á kortinu. Stærð punkta fylgir völdu umferðargildi. Litir eru hlutfallslegir miðað við teljarana sem eru í úrtakinu, ekki opinbert hættumat.")
+        else:
+            st.warning("Engin kortahniti fundust fyrir valið úrtak.")
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.link_button("Opna WFS þjónustu Vegagerðarinnar", "https://gagnaveita.vegagerdin.is/geoserver/gis/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=gis:umferdvika_2021_1")
-    with col_b:
-        st.link_button("Opna Gagnaveitu Vegagerðarinnar", "https://gagnaveita.vegagerdin.is/")
+    with tab_top:
+        st.markdown("### 📊 Hvar er mest umferð?")
+        if metric and metric in view.columns:
+            chart_df = view.copy()
+            chart_df[metric] = pd.to_numeric(chart_df[metric], errors="coerce").fillna(0)
+            top = chart_df[["nafn", "idstod", metric, "lat", "lon"]].sort_values(metric, ascending=False).head(20)
+            if not top.empty:
+                fig_bar = px.bar(
+                    top.sort_values(metric),
+                    x=metric,
+                    y="nafn",
+                    orientation="h",
+                    title=f"Umferðarmestu teljarar: {traffic_friendly_label(metric)}",
+                    labels={metric: traffic_friendly_label(metric), "nafn": "Teljari"},
+                )
+                fig_bar.update_layout(height=620, margin={"r":20,"t":60,"l":20,"b":20})
+                st.plotly_chart(fig_bar, use_container_width=True)
+                st.dataframe(top, use_container_width=True, hide_index=True)
+            else:
+                st.info("Engin gildi fundust fyrir valinn dálk.")
+        else:
+            st.info("Enginn talnadálkur fannst til að birta samanburð.")
 
+    with tab_data:
+        st.markdown("### 🔎 Skoða og sía gögn")
+        st.write("Hér er hægt að skoða hráu teljaragögnin eftir að þau hafa verið lesin inn í vefinn.")
+        show_cols = [c for c in ["nafn", "idstod", "lat", "lon", metric, "umferdarstig"] if c and c in map_df.columns]
+        extra_cols = [c for c in numeric_cols if c not in show_cols][:10]
+        if not map_df.empty:
+            st.dataframe(map_df[show_cols + extra_cols].head(300), use_container_width=True, hide_index=True)
+            csv = map_df[show_cols + extra_cols].to_csv(index=False).encode("utf-8-sig")
+            st.download_button("⬇️ Sækja Suðurlandsúrtak sem CSV", csv, file_name="umferdarteljarar_sudurland.csv", mime="text/csv")
+        else:
+            st.info("Ekkert úrtak til að sýna.")
+
+    with tab_tasks:
+        st.markdown("### 🧑‍🏫 Verkefnahugmyndir")
+        task = f"""Verkefni: Umferð á Suðurlandi
+
+1. Opnaðu Umferðarteljara í Veðurvefnum.
+2. Veldu mæligildið: {traffic_friendly_label(metric) if metric else 'umferðargildi'}.
+3. Finndu þrjá umferðarmestu teljarana á kortinu.
+4. Hvað eiga þessir staðir sameiginlegt? Hugsaðu um bæi, hafnir, ferðamannaleiðir og helstu vegi.
+5. Berðu saman við veðrið í dag: gæti vindur, rigning eða hálka haft áhrif á umferð?
+6. Skrifaðu stutta niðurstöðu með að minnsta kosti tveimur tölum úr gögnunum.
+"""
+        st.text_area("Afritanlegt verkefni", task, height=230)
+        st.markdown("""
+        **Fleiri verkefni:**
+        - Finnið teljara nálægt Selfossi, Hveragerði og Hellu. Hvar er mest umferð?
+        - Reiknið muninn á hæsta og lægsta gildinu í topp 10.
+        - Ræðið af hverju gögn geta verið tóm eða ólík milli daga.
+        - Teiknið eigin umferðarkort og merkið helstu leiðir á Suðurlandi.
+        """)
+        c1, c2, c3 = st.columns(3)
+        c1.link_button("Opna WFS þjónustu", "https://gagnaveita.vegagerdin.is/geoserver/gis/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=gis:umferdvika_2021_1", use_container_width=True)
+        c2.link_button("Gagnaveita Vegagerðarinnar", "https://gagnaveita.vegagerdin.is/", use_container_width=True)
+        c3.link_button("Umferðin.is", "https://umferdin.is/", use_container_width=True)
 
 def get_numeric_traffic_columns(df):
     """Finnur talnadálka í umferðargögnum á öruggan hátt."""
@@ -3845,7 +3955,8 @@ def render_weather_traffic_comparison(place, current, hourly, selected_route):
             mapbox_style="open-street-map",
         )
         fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
+        st.caption("💡 Notaðu músarhjól eða trackpad til að zooma inn á umferðarkortið.")
 
     if metric and metric in view.columns:
         bar_df = view.copy()
@@ -4156,10 +4267,19 @@ def main():
         place_index = place_options.index(st.session_state["selected_place"])
         place = st.selectbox("Veldu stað", place_options, index=place_index)
         st.session_state["selected_place"] = place
-        page = st.radio(
-            "Veldu síðu",
-            ["Yfirlit", "Viðvaranir", "Veðurborð skólans", "Kennaraumsjón", "Umferðarteljarar", "Veður + umferð", "Öryggismælir ferða", "Suðurlandsmælir", "Veðurstjóri skólans", "Veðurstofa bekkjarins", "Veðurleiðangrar", "Veðurdagbók", "Vegalengdir", "Veðurtákn", "Kortamiðstöð", "Spá", "Skólaveður", "Ferðaveður", "Kort", "Fróðleikur", "Gögn og tengingar"],
-        )
+        page_groups = {
+            "🏠 Yfirlit og spá": ["Yfirlit", "Viðvaranir", "Spá", "Skólaveður", "Veðurborð skólans"],
+            "🧑‍🏫 Kennsla": ["Kennaraumsjón", "Veðurstjóri skólans", "Veðurstofa bekkjarins", "Veðurleiðangrar", "Veðurdagbók", "Veðurtákn"],
+            "🚗 Ferðir og umferð": ["Umferðarteljarar", "Veður + umferð", "Öryggismælir ferða", "Ferðaveður", "Vegalengdir", "Kortamiðstöð", "Kort"],
+            "🌍 Fróðleikur og gögn": ["Suðurlandsmælir", "Fróðleikur", "Gögn og tengingar"],
+        }
+        group = st.selectbox("Veldu flokk", list(page_groups.keys()), index=0)
+        page = st.radio("Veldu síðu", page_groups[group])
+        with st.expander("Sjá allar síður", expanded=False):
+            all_pages = [p for pages in page_groups.values() for p in pages]
+            quick_page = st.selectbox("Flýtival", all_pages, index=all_pages.index(page), key="quick_page_all")
+            if quick_page != page:
+                page = quick_page
         selected_route = st.selectbox("Ferðaleið", list(ROUTES.keys()), index=0)
         st.caption("Ferðaleiðin er notuð í Ferðaveður/Kortamiðstöð. Fyrir frjálst val á tveimur stöðum: opnaðu flipann 📏 Vegalengdir.")
         try:
